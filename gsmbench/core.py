@@ -1,9 +1,42 @@
 """Measurement recipes and comparison, independent of UI and hardware."""
 
 from dataclasses import asdict, dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations
+from heapq import nsmallest
 import math
 import random
+
+
+def source_step(value, kind="diode"):
+    """Programming resolution, not accuracy; GSM-20H10 manual, p. 368."""
+    ranges = (("0.000001", "0.00000000001"), ("0.00001", "0.0000000001"),
+              ("0.0001", "0.000000001"), ("0.001", "0.00000001"),
+              ("0.01", "0.0000001"), ("0.1", "0.000001")) if kind == "diode" else (
+              ("0.2", "0.000001"), ("2", "0.00001"), ("20", "0.0001"))
+    for maximum, step in ranges:
+        if Decimal(str(abs(value))) <= Decimal(maximum):
+            return Decimal(step)
+    raise ValueError("Точка вне диапазонов методики")
+
+
+def quantize_levels(levels, kind="diode"):
+    result = []
+    for value in levels:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Точки должны быть положительными конечными числами")
+        step = source_step(value, kind)
+        rounded = float(Decimal(str(value)).quantize(step, rounding=ROUND_HALF_UP))
+        if rounded <= 0 or result and rounded <= result[-1]:
+            raise ValueError("После округления точки совпадают: уменьшите их число или расширьте диапазон")
+        result.append(rounded)
+    return tuple(result)
+
+
+def format_level(value, kind="diode"):
+    scaled = Decimal(str(value)) * (1000 if kind == "diode" else 1)
+    text = format(scaled, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def generate_levels(start, stop, count=20, spacing="log"):
@@ -32,12 +65,18 @@ class Recipe:
     temperature: float = 23.0
     wires: int = 2
     terminals: str = "front"
+    nplc: float = 1.0
+    digits: float = 5.5
 
     def validate(self):
         if self.kind not in ("diode", "j310"):
             raise ValueError("Неизвестная методика")
         if self.wires not in (2, 4) or self.terminals not in ("front", "rear"):
             raise ValueError("Схема подключения: 2/4 провода, передние/задние клеммы")
+        if not math.isfinite(self.nplc) or not 0.01 <= self.nplc <= 10:
+            raise ValueError("NPLC: от 0,01 до 10")
+        if self.digits not in (3.5, 4.5, 5.5, 6.5):
+            raise ValueError("Разрядность: 3½, 4½, 5½ или 6½")
         if not 1 <= len(self.levels) <= 200:
             raise ValueError("Нужно от 1 до 200 точек")
         values = (*self.levels, self.limit, self.delay, self.temperature)
@@ -56,7 +95,8 @@ class Recipe:
             raise ValueError("Для этой методики Vds × Iлим должно быть ≤ 0,3 Вт")
 
     def signature(self):
-        return self.kind, tuple(self.levels), self.limit, self.delay, self.temperature, self.wires, self.terminals
+        return (self.kind, tuple(self.levels), self.limit, self.delay, self.temperature,
+                self.wires, self.terminals, self.nplc, self.digits)
 
 
 @dataclass(frozen=True)
@@ -105,28 +145,54 @@ def simulate(recipe, seed=None):
     return points
 
 
-def match_groups(runs, size, tolerance):
-    """Rank all compatible sets; a result may occur in multiple candidate sets."""
-    if size not in (2, 4) or not math.isfinite(tolerance) or tolerance <= 0:
-        raise ValueError("Размер группы: 2 или 4; допуск должен быть положительным")
+def _candidate_groups(runs, size):
     if len(runs) > 60:
         raise ValueError("Выберите не более 60 измерений одной партии")
-    ranked = []
-    for group in combinations(runs, size):
-        first = group[0]
-        signature = Recipe(**first["recipe"]).signature()
-        if any(Recipe(**r["recipe"]).signature() != signature or
-               r["model"] != first["model"] or r["demo"] != first["demo"] or
-               r["batch"] != first["batch"] or r["state"] != "complete" for r in group):
+    buckets = {}
+    for run in runs:
+        recipe = Recipe(**run["recipe"])
+        if run["state"] != "complete" or len(run["points"]) != len(recipe.levels):
             continue
-        if len({r["sample"] for r in group}) != size:
+        if any(not Point(**point).valid for point in run["points"]):
             continue
-        if any(len(r["points"]) != len(signature[1]) or
-               any(not Point(**p).valid for p in r["points"]) for r in group):
-            continue
-        field = "voltage" if signature[0] == "diode" else "current"
-        worst = max(max(r["points"][i][field] for r in group) -
-                    min(r["points"][i][field] for r in group) for i in range(len(signature[1])))
-        if worst <= tolerance:
-            ranked.append((worst, group))
-    return sorted(ranked, key=lambda item: item[0])[:100]
+        key = (recipe.signature(), run["model"], run["demo"], run["batch"])
+        buckets.setdefault(key, []).append(run)
+    for bucket in buckets.values():
+        for group in combinations(bucket, size):
+            if len({run["sample"] for run in group}) == size:
+                yield group
+
+
+def match_groups(runs, size, tolerance):
+    """Rank compatible sets by individual spread; candidate sets may overlap."""
+    if size not in (2, 4) or not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Размер группы: 2 или 4; допуск должен быть положительным")
+
+    def candidates():
+        for group in _candidate_groups(runs, size):
+            field = "voltage" if group[0]["recipe"]["kind"] == "diode" else "current"
+            worst = max(max(r["points"][i][field] for r in group) -
+                        min(r["points"][i][field] for r in group) for i in range(len(group[0]["points"])))
+            if worst <= tolerance + 1e-12:
+                yield worst, group
+
+    return nsmallest(100, candidates(), key=lambda item: item[0])
+
+
+def match_pair_sums(runs, tolerance):
+    """Rank all three partitions of each quartet by |V1+V2-V3-V4| at every current."""
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Допуск должен быть положительным")
+
+    def candidates():
+        for group in _candidate_groups(runs, 4):
+            if group[0]["recipe"]["kind"] != "diode":
+                continue
+            for a, b, c, d in ((0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2)):
+                worst = max(abs(group[a]["points"][i]["voltage"] + group[b]["points"][i]["voltage"] -
+                                group[c]["points"][i]["voltage"] - group[d]["points"][i]["voltage"])
+                            for i in range(len(group[0]["points"])))
+                if worst <= tolerance + 1e-12:
+                    yield worst, ((group[a], group[b]), (group[c], group[d]))
+
+    return nsmallest(100, candidates(), key=lambda item: item[0])

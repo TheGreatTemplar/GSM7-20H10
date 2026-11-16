@@ -9,7 +9,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from gsmbench.core import Point, Recipe, generate_levels, match_groups, parse_reading, simulate
+from gsmbench.core import (Point, Recipe, format_level, generate_levels, match_groups, match_pair_sums,
+                           parse_reading, quantize_levels, simulate)
 from gsmbench.instrument import Instrument
 from gsmbench.storage import Store, new_run
 
@@ -36,6 +37,8 @@ class FakeTransport:
         self.bad_status = False
         self.terminals = "FRON"
         self.remote_sense = "0"
+        self.nplc = "1"
+        self.digits = "6"
 
     def write(self, command):
         self.commands.append(command)
@@ -43,6 +46,10 @@ class FakeTransport:
             self.terminals = command.split()[1]
         if command.startswith(":SYST:RSEN "):
             self.remote_sense = "1" if command.endswith("ON") else "0"
+        if command.startswith(":SENS:VOLT:NPLC "):
+            self.nplc = command.split()[1]
+        if command.startswith(":DISP:DIG "):
+            self.digits = command.split()[1]
         if command.startswith((":SOUR:LIST:CURR ", ":SOUR:LIST:VOLT ")):
             self.levels = command.split(" ", 1)[1].split(",")
         elif command.startswith((":SOUR:LIST:CURR:APP ", ":SOUR:LIST:VOLT:APP ")):
@@ -56,6 +63,10 @@ class FakeTransport:
             return self.terminals
         if command == ":SYST:RSEN?":
             return self.remote_sense
+        if command == ":SENS:VOLT:NPLC?":
+            return self.nplc
+        if command == ":DISP:DIG?":
+            return self.digits
         if command == ":FETC?":
             if self.bad_read:
                 raise TimeoutError("Simulated connection failure")
@@ -140,8 +151,27 @@ class CoreTests(unittest.TestCase):
                 self.assertIn(":SYST:RSEN " + ("ON" if wires == 4 else "OFF"), transport.commands)
                 self.assertIn(":ROUT:TERM " + ("FRON" if terminals == "front" else "REAR"), transport.commands)
 
+    def test_source_resolution_and_readable_milliamps(self):
+        values = quantize_levels((1e-6, 1.63194259562e-6, 0.01123456789, 0.1))
+        self.assertEqual(values, (1e-6, 1.6319e-6, 0.011235, 0.1))
+        self.assertEqual([format_level(v) for v in values], ["0.001", "0.0016319", "11.235", "100"])
+        self.assertEqual(quantize_levels((0.12345678, 1.23456789, 5.12345678), "j310"),
+                         (0.123457, 1.23457, 5.1235))
+        with self.assertRaisesRegex(ValueError, "совпадают"):
+            quantize_levels((0.001, 0.001000001))
+
+    def test_nplc_and_display_digits_commands_and_validation(self):
+        for digits in (3.5, 4.5, 5.5, 6.5):
+            transport = FakeTransport()
+            Instrument(transport).measure(Recipe(nplc=10, digits=digits), threading.Event(), lambda point: None)
+            self.assertIn(":SENS:VOLT:NPLC 10", transport.commands)
+            self.assertIn(f":DISP:DIG {int(digits + 0.5)}", transport.commands)
+        for recipe in (Recipe(nplc=0), Recipe(nplc=11), Recipe(nplc=float("nan")), Recipe(digits=6)):
+            with self.assertRaises(ValueError):
+                recipe.validate()
+
     def test_connection_conditions_prevent_mixed_matching(self):
-        for key, value in (("wires", 4), ("terminals", "rear")):
+        for key, value in (("wires", 4), ("terminals", "rear"), ("nplc", 10), ("digits", 6.5)):
             first, second = make_run("D1"), make_run("D2")
             second["recipe"][key] = value
             self.assertFalse(match_groups([first, second], 2, 0.01))
@@ -156,6 +186,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(match_groups(runs, 4, 0.005)), 1)
         runs[3]["points"][0]["voltage"] += 0.02
         self.assertFalse(match_groups(runs, 4, 0.005))
+
+    def test_pair_sums_match_dissimilar_diodes(self):
+        runs = [make_run("D1"), make_run("D2", 0.08), make_run("D3", 0.03), make_run("D4", 0.05)]
+        self.assertFalse(match_groups(runs, 4, 0.005))
+        groups = match_pair_sums(runs, 0.005)
+        self.assertEqual(len(groups), 1)
+        self.assertAlmostEqual(groups[0][0], 0)
+        first, second = groups[0][1]
+        self.assertEqual({r["sample"] for r in first}, {"D1", "D2"})
+        self.assertEqual({r["sample"] for r in second}, {"D3", "D4"})
+        runs[3]["points"][0]["voltage"] += 0.02
+        self.assertFalse(match_pair_sums(runs, 0.005))
+
+    def test_pair_sums_all_three_partitions_and_unique_samples(self):
+        runs = [make_run(f"D{index}") for index in range(4)]
+        self.assertEqual(len(match_pair_sums(runs, 0.005)), 3)
+        runs[3]["sample"] = runs[0]["sample"]
+        self.assertFalse(match_pair_sums(runs, 0.005))
+
+    def test_pair_sums_tolerance_boundary(self):
+        runs = [make_run("D1"), make_run("D2", 0.08), make_run("D3", 0.03), make_run("D4", 0.055)]
+        self.assertEqual(len(match_pair_sums(runs, 0.005)), 1)
+        self.assertFalse(match_pair_sums(runs, 0.0049))
+
+    def test_pair_sums_reject_incompatible_conditions(self):
+        for key, value in (("state", "failed"), ("model", "other"), ("batch", "other"), ("demo", False)):
+            runs = [make_run(f"D{index}") for index in range(4)]
+            runs[0][key] = value
+            self.assertFalse(match_pair_sums(runs, 0.005))
 
     def test_incompatible_and_failed_runs_excluded(self):
         for key, value in [("state", "failed"), ("sample", "D1"), ("demo", False), ("model", "other")]:

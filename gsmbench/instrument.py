@@ -164,7 +164,8 @@ class Instrument:
                     f":SOUR:{mode}:MODE FIX", f":SOUR:{mode}:RANG:AUTO ON",
                     f":SOUR:{mode} 0", f":SENS:{sense}:PROT {recipe.limit:.12g}",
                     ':SENS:FUNC "VOLT","CURR"', ":SENS:VOLT:RANG:AUTO ON",
-                    ":SENS:CURR:RANG:AUTO ON", ":FORM:DATA ASC",
+                    ":SENS:CURR:RANG:AUTO ON", f":SENS:VOLT:NPLC {recipe.nplc:g}",
+                    f":DISP:DIG {int(recipe.digits + 0.5)}", ":FORM:DATA ASC",
                     ":FORM:ELEM VOLT,CURR,STAT", f":TRIG:COUN {count}", ":ARM:COUN 1",
                     ":ARM:SOUR IMM", ":TRIG:SOUR IMM", ":TRIG:DEL 0",
                     ":SOUR:CLE:AUTO ON", ":SOUR:CLE:AUTO:MODE TCO",
@@ -182,6 +183,10 @@ class Instrument:
             raise RuntimeError("Прибор не подтвердил выбранные клеммы: " + actual_terminal)
         if float(self.io.query(":SYST:RSEN?")) != int(recipe.wires == 4):
             raise RuntimeError("Прибор не подтвердил схему измерения")
+        if abs(float(self.io.query(":SENS:VOLT:NPLC?")) - recipe.nplc) > 1e-6:
+            raise RuntimeError("Прибор не подтвердил NPLC")
+        if float(self.io.query(":DISP:DIG?")) not in (recipe.digits, recipe.digits + 0.5):
+            raise RuntimeError("Прибор не подтвердил разрядность")
         # The manual limits each LIST/APPEND message to 100 entries.
         for offset in range(0, count, 100):
             if stop.is_set():
@@ -226,7 +231,7 @@ class Instrument:
         # On V1.24 a query during INIT blocks even ABOR processing. Leave the
         # command channel free during acquisition; Event.wait wakes on STOP.
         # Include time for two measurements and source autorange settling.
-        return stop.wait(len(recipe.levels) * (recipe.delay + 0.25) + 0.5)
+        return stop.wait(len(recipe.levels) * (recipe.delay + 0.21 + 0.04 * recipe.nplc) + 0.5)
 
     def measure(self, recipe, stop, on_point):
         recipe.validate()
@@ -240,7 +245,7 @@ class Instrument:
                 return
             self.io.write(":INIT")
             count = len(recipe.levels)
-            deadline = time.monotonic() + max(10, count * (recipe.delay + 1) + 5)
+            deadline = time.monotonic() + max(10, count * (recipe.delay + 1 + 0.04 * recipe.nplc) + 5)
             previous = 0
             cancel_sent = False
 

@@ -1,4 +1,4 @@
 """GSM7-20H10 semiconductor selection bench."""
 
-__version__ = "0.2.0"
-__release_date__ = "15.11.2026"
+__version__ = "0.8.3"
+__release_date__ = "16.11.2026"
