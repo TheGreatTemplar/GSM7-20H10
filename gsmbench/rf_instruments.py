@@ -7,6 +7,15 @@ Measurement-specific drivers will use the verified firmware/options inventory.
 import ipaddress
 
 
+def connection_error_message(model, endpoint, error):
+    text = str(error)
+    if isinstance(error, TimeoutError) or "-1073807339" in text:
+        return f"{model} [{endpoint}]: прибор не ответил при подключении (тайм-аут). Проверьте питание, адрес и соединение."
+    if "could not connect" in text.lower() or isinstance(error, ConnectionError):
+        return f"Не удалось подключиться к {model} [{endpoint}]: {text}"
+    return None
+
+
 def lan_resource(host):
     host = str(ipaddress.IPv4Address(host.strip()))
     return f"TCPIP0::{host}::inst0::INSTR"

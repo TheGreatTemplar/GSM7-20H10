@@ -17,6 +17,10 @@ from .instrument import Instrument, SocketTransport, VisaTransport
 from .storage import Store, new_run
 from .help_ui import AboutDialog, HelpDialog
 from .rsa_ui import RsaWindow
+from .table_filters import FilterHeader
+from .detector_ui import DetectorPanel
+from .window_chrome import install_window_chrome
+from .button_hints import install_button_hints
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,20 +38,23 @@ QGroupBox
 {
     border: 1px solid #314055;
     border-radius: 8px;
-    margin-top: 14px;
-    padding: 12px 8px 8px 8px;
+    margin-top: 10px;
+    padding: 7px 7px 6px 7px;
 }
 QGroupBox::title
 {
     color: #8191a8;
     subcontrol-origin: margin;
-    left: 12px;
+    subcontrol-position: top left;
+    left: 10px;
+    top: 1px;
+    padding: 0px 3px;
 }
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QPlainTextEdit, QTableWidget
 {
     background: #192536;
     border: 1px solid #314055;
-    padding: 5px;
+    padding: 3px 5px;
     selection-background-color: #305d70;
 }
 QPushButton
@@ -55,7 +62,11 @@ QPushButton
     background: #26384c;
     border: 1px solid #405570;
     border-radius: 5px;
-    padding: 8px;
+    padding: 5px 8px;
+}
+QToolButton
+{
+    padding: 3px 6px;
 }
 QPushButton:hover
 {
@@ -64,6 +75,37 @@ QPushButton:hover
 QPushButton:disabled
 {
     color: #607087;
+}
+QCheckBox
+{
+    spacing: 6px;
+}
+QCheckBox::indicator
+{
+    width: 14px;
+    height: 14px;
+    border: 2px solid #8ea6c0;
+    border-radius: 3px;
+    background: #192536;
+}
+QCheckBox::indicator:hover
+{
+    border-color: #64dcd4;
+}
+QCheckBox::indicator:checked, QCheckBox::indicator:indeterminate
+{
+    background: #17645f;
+    border-color: #64dcd4;
+    image: url("CHECKBOX_CHECK_URL");
+}
+QCheckBox::indicator:indeterminate
+{
+    image: url("CHECKBOX_PARTIAL_URL");
+}
+QCheckBox::indicator:disabled
+{
+    border-color: #596a7e;
+    background: #253243;
 }
 QPushButton#start
 {
@@ -82,7 +124,7 @@ QProgressBar
     border: 1px solid #405570;
     border-radius: 4px;
     text-align: center;
-    min-height: 22px;
+    min-height: 19px;
 }
 QProgressBar::chunk
 {
@@ -92,12 +134,12 @@ QProgressBar::chunk
 QHeaderView::section
 {
     background: #223247;
-    padding: 6px;
+    padding: 4px 6px;
     border: 0px;
 }
 QTabBar::tab
 {
-    padding: 9px 10px;
+    padding: 6px 9px;
     background: #182333;
     color: #a5b4c8;
     border: 1px solid #3b5068;
@@ -123,7 +165,8 @@ QTabWidget::pane
     border: 1px solid #3b5068;
     top: 0px;
 }
-"""
+""".replace("CHECKBOX_CHECK_URL", (ROOT / "assets" / "checkbox-check.svg").as_posix()).replace(
+    "CHECKBOX_PARTIAL_URL", (ROOT / "assets" / "checkbox-partial.svg").as_posix())
 
 
 class Worker(QtCore.QThread):
@@ -194,7 +237,7 @@ class ColumnFilterDialog(QtWidgets.QDialog):
     def __init__(self, title, values, selected, parent):
         super().__init__(parent)
         self.setWindowTitle("Фильтр · " + title)
-        self.resize(360, 440)
+        self.resize(360, 460)
         layout = QtWidgets.QVBoxLayout(self)
         self.search = QtWidgets.QLineEdit()
         self.search.setPlaceholderText("Найти значение…")
@@ -207,6 +250,17 @@ class ColumnFilterDialog(QtWidgets.QDialog):
             item.setCheckState(QtCore.Qt.CheckState.Checked if selected is None or value in selected
                                else QtCore.Qt.CheckState.Unchecked)
         layout.addWidget(self.values)
+        all_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(all_row)
+        self.select_all = QtWidgets.QCheckBox("Выбрать всё")
+        self.select_all.setTristate(True)
+        self.select_all.clicked.connect(lambda checked: self.check_all(checked))
+        all_row.addWidget(self.select_all)
+        self.clear_all = QtWidgets.QPushButton("Снять всё")
+        self.clear_all.clicked.connect(lambda: self.check_all(False))
+        all_row.addWidget(self.clear_all)
+        self.values.itemChanged.connect(self.update_all_state)
+        self.update_all_state()
         row = QtWidgets.QHBoxLayout()
         layout.addLayout(row)
         for label, state in (("Выбрать найденные", True), ("Снять найденные", False)):
@@ -233,6 +287,21 @@ class ColumnFilterDialog(QtWidgets.QDialog):
             if not item.isHidden():
                 item.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
 
+    def check_all(self, checked):
+        blocker = QtCore.QSignalBlocker(self.values)
+        for index in range(self.values.count()):
+            self.values.item(index).setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+        del blocker
+        self.update_all_state()
+
+    def update_all_state(self, *args):
+        checked = len(self.selected_values())
+        state = (QtCore.Qt.CheckState.Unchecked if checked == 0 else QtCore.Qt.CheckState.Checked
+                 if checked == self.values.count() else QtCore.Qt.CheckState.PartiallyChecked)
+        blocker = QtCore.QSignalBlocker(self.select_all)
+        self.select_all.setCheckState(state)
+        del blocker
+
     def selected_values(self):
         return {self.values.item(index).data(QtCore.Qt.ItemDataRole.UserRole)
                 for index in range(self.values.count())
@@ -242,6 +311,8 @@ class ColumnFilterDialog(QtWidgets.QDialog):
 class Window(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
+        install_window_chrome()
+        install_button_hints()
         self.worker = None
         self.runs = []
         self.column_filters = {}
@@ -254,10 +325,12 @@ class Window(QtWidgets.QMainWindow):
         self.about_dialog = None
         self.rsa_window = None
         self.rsa_settings = {}
+        self.detector_window = None
+        self.detector_settings = {}
         self.setWindowIcon(QtGui.QIcon(str(ICON_PATH)))
         self.setWindowTitle(f"GSM7-20H10 · Компоненты и смесители · v{__version__}")
-        self.resize(1380, 900)
-        self.setMinimumSize(1100, 720)
+        self.resize(1320, 840)
+        self.setMinimumSize(1000, 650)
         self.setStyleSheet(STYLE)
         self.build_menu()
         self.build()
@@ -271,6 +344,7 @@ class Window(QtWidgets.QMainWindow):
         instruments_menu = self.menuBar().addMenu("Приборы")
         self.rsa_action = instruments_menu.addAction("Смесители · RSA6265 + SMU200A", self.show_rsa)
         instruments_menu.addAction("R&S SMU200A · Состояние выходов…", self.show_smu)
+        instruments_menu.addAction("Детектор мощности LO · калибровка", self.show_detector)
         help_menu = self.menuBar().addMenu("Справка")
         self.help_action = help_menu.addAction("Помощь по программе…", self.show_help, "F1")
         help_menu.addSeparator()
@@ -300,6 +374,26 @@ class Window(QtWidgets.QMainWindow):
     def workspace_changed(self, index):
         if index == 1:
             self.show_rsa()
+        elif index == 2:
+            self.show_detector()
+
+    def show_detector(self):
+        if self.detector_window is None:
+            self.detector_window = DetectorPanel(self, ROOT, self.detector_settings)
+            self.detector_window.settings_changed.connect(self.save_detector_settings)
+            self.detector_layout.addWidget(self.detector_window)
+        self.workspaces.setCurrentWidget(self.detector_page)
+
+    def save_detector_settings(self, settings):
+        self.detector_settings = settings
+        self.settings_timer.start()
+
+    def detector_busy(self):
+        return self.detector_window is not None and (self.detector_window.worker is not None or self.detector_window.unsafe_outputs)
+
+    def rf_workspace_busy(self):
+        return self.rsa_window is not None and (self.rsa_window.worker is not None or self.rsa_window.generator_active
+            or self.rsa_window.two_tone.worker is not None or self.rsa_window.two_tone.unsafe_outputs)
 
     def save_rsa_settings(self, settings):
         self.rsa_settings = settings
@@ -317,7 +411,7 @@ class Window(QtWidgets.QMainWindow):
             screen = QtWidgets.QApplication.screenAt(QtGui.QCursor.pos()) or QtWidgets.QApplication.primaryScreen()
             if screen is not None:
                 available = screen.availableGeometry()
-                self.setMinimumSize(min(1100, available.width()), min(720, available.height()))
+                self.setMinimumSize(min(1000, available.width()), min(650, available.height()))
                 self.resize(min(self.width(), available.width()), min(self.height(), available.height()))
                 frame = self.frameGeometry()
                 frame.moveCenter(available.center())
@@ -344,6 +438,9 @@ class Window(QtWidgets.QMainWindow):
         self.mixers_page = QtWidgets.QWidget()
         self.mixers_layout = QtWidgets.QVBoxLayout(self.mixers_page)
         self.workspaces.addTab(self.mixers_page, "Смесители")
+        self.detector_page = QtWidgets.QWidget()
+        self.detector_layout = QtWidgets.QVBoxLayout(self.detector_page)
+        self.workspaces.addTab(self.detector_page, "Детектор мощности LO")
         self.workspaces.currentChanged.connect(self.workspace_changed)
         layout = QtWidgets.QVBoxLayout(root)
         layout.setContentsMargins(22, 18, 22, 12)
@@ -535,6 +632,7 @@ class Window(QtWidgets.QMainWindow):
         splitter.addWidget(tabs)
         self.table = QtWidgets.QTableWidget(0, 8)
         self.table_headers = ["Образец", "Марка", "Партия", "Метод", "Дата UTC", "Статус", "Точек", "Результат"]
+        self.table.setHorizontalHeader(FilterHeader(self.table))
         self.table.setHorizontalHeaderLabels(self.table_headers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -675,7 +773,8 @@ class Window(QtWidgets.QMainWindow):
                     result_tab=self.result_tabs.currentIndex(), workspace_tab=self.workspaces.currentIndex(),
                     table_search=self.table_search.text(),
                     column_filters={str(column): sorted(values) for column, values in self.column_filters.items()},
-                    rsa=self.rsa_window.settings() if self.rsa_window is not None else self.rsa_settings)
+                    rsa=self.rsa_window.settings() if self.rsa_window is not None else self.rsa_settings,
+                    detector=self.detector_window.settings() if self.detector_window is not None else self.detector_settings)
 
     def setting_widgets(self):
         return dict(kind=self.kind, sample=self.sample, model=self.model, batch=self.batch,
@@ -691,6 +790,8 @@ class Window(QtWidgets.QMainWindow):
                 data = json.loads(SETTINGS.read_text(encoding="utf-8"))
                 if isinstance(data.get("rsa"), dict):
                     self.rsa_settings = data["rsa"]
+                if isinstance(data.get("detector"), dict):
+                    self.detector_settings = data["detector"]
                 self.column_filters = {int(column): set(values)
                                        for column, values in data.get("column_filters", {}).items()
                                        if column.isdigit() and 0 <= int(column) < self.table.columnCount()
@@ -730,6 +831,8 @@ class Window(QtWidgets.QMainWindow):
                 self.update_levels_tooltip()
                 if data.get("workspace_tab") == 1:
                     self.workspaces.setCurrentIndex(1)
+                elif data.get("workspace_tab") == 2:
+                    self.workspaces.setCurrentIndex(2)
             except Exception as error:
                 self.error(str(error))
 
@@ -976,6 +1079,7 @@ class Window(QtWidgets.QMainWindow):
             header.setText(title + (" ● ▼" if column in self.column_filters else " ▼"))
             header.setToolTip("Выбрать значения · " + title)
         self.filter_count.setText(f"Показано: {visible} / {self.table.rowCount()}")
+        self.table.horizontalHeader().set_active_filters(self.column_filters)
         del blocker
         if update_plot and selection_changed:
             self.plot_selected()
@@ -1154,6 +1258,20 @@ class Window(QtWidgets.QMainWindow):
             self.error(str(error))
 
     def closeEvent(self, event):
+        if self.detector_busy():
+            self.detector_window.stop()
+            event.ignore()
+            self.status.setText("Дождитесь завершения калибровки детектора и подтверждения RF OFF")
+            return
+        if self.rsa_window is not None and self.rsa_window.archive_worker is not None:
+            if self.rf_workspace_busy():
+                self.rsa_window.stop()
+            self.rsa_window.cancel_archive()
+            event.ignore()
+            QtCore.QTimer.singleShot(100, self.close)
+            return
+        if self.rsa_window is not None:
+            self.rsa_window.cancel_archive()
         if self.rsa_window is not None and (self.rsa_window.worker is not None or self.rsa_window.generator_active or
                 self.rsa_window.two_tone.worker is not None or self.rsa_window.two_tone.unsafe_outputs):
             self.rsa_window.stop()

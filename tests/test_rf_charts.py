@@ -53,3 +53,16 @@ class ChartTests(unittest.TestCase):
         groups, skipped = chart_groups([spectrum], "rf_hz", "output")
         self.assertEqual(skipped, 0)
         self.assertAlmostEqual(groups[0]["points"][0]["y"], -27)
+
+    def test_do_not_merge_trace_grid_averaging_or_separate_full_tests(self):
+        first = sample()
+        different_count = sample(15e6)
+        different_count["settings"]["points"] = 3201
+        different_average = sample(16e6)
+        different_average["averaging"] = dict(count=5, method="linear_power", marker_std_db=0.03)
+        different_run = sample(17e6)
+        different_run["context"]["full_test_id"] = "other-run"
+        groups, skipped = chart_groups([first, different_count, different_average, different_run], "rf_hz", "raw_loss")
+        self.assertEqual(skipped, 0)
+        self.assertEqual(len(groups), 4)
+        self.assertEqual(groups[2]["points"][0]["sweep_std_db"], 0.03)

@@ -2,3 +2,4 @@ PySide6>=6.8,<7
 pyqtgraph>=0.13,<0.15
 PyVISA>=1.14,<2
 PyVISA-py>=0.7,<0.9
+pyserial>=3.5,<4

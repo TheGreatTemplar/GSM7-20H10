@@ -7,17 +7,22 @@ from pathlib import Path
 import threading
 import uuid
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from .mixer import compression_1db, difference_if
 from .rf_storage import SpectrumStore
 from .rf_charts import ArchiveCharts
 from .two_tone_ui import TwoTonePanel
+from .form_layout import compact_inputs
+from .validation import FieldFeedback, StatusLabel
+from .rf_labels import RSA_ATTENUATION, SETTLING_TIME
 from .rf_methods import ISOLATION_PORTS, METHOD_CHOICES, injection_loss, injection_port, target_frequency
 from .rf_sequence import active_channels, matrix_axes, plan_sequence, sequence_count
-from .rsa import AcquisitionCancelled, AnalyzerConfig, Rsa6265, demo_spectrum, frequencies, mixer_result
+from .rsa import AcquisitionCancelled, AnalyzerConfig, Rsa6265, average_spectra, demo_spectrum, frequencies, mixer_result
 from .smu import Smu200a, SourcePlan, verified_off
+from .table_filters import FilterHeader
+from .rf_archive import ArchiveLoader, archive_rows
 
 
 class RsaWorker(QtCore.QThread):
@@ -27,13 +32,42 @@ class RsaWorker(QtCore.QThread):
     failed = QtCore.Signal(str)
     generator_state = QtCore.Signal(object)
 
-    def __init__(self, host, demo, operation, config, context, count, interval, parent, source_settings=None):
+    def __init__(self, host, demo, operation, config, context, count, interval, parent, source_settings=None, averages=1):
         super().__init__(parent)
         self.host, self.demo, self.operation = host, demo, operation
         self.config, self.context = config, context
         self.count, self.interval = count, interval
         self.stop = threading.Event()
         self.source_settings = source_settings
+        if type(averages) is not int or not 1 <= averages <= 50:
+            raise ValueError("Усреднение RSA: 1…50 развёрток")
+        self.averages = averages
+
+    def capture(self, driver, config, context, automatic, source=None, expected=None):
+        spectra = []
+        count = 1 if self.operation == "read" else self.averages
+        for index in range(count):
+            if self.stop.is_set():
+                raise AcquisitionCancelled()
+            self.status.emit(f"Развёртка {index + 1}/{count} в текущей точке")
+            spectrum = (demo_spectrum(config) if self.demo else
+                driver.read_current() if self.operation == "read" else driver.acquire(self.stop))
+            if count > 1 and spectrum.get("if_overload"):
+                raise ValueError("Перегрузка RSA; серия усреднения прервана")
+            if source and source.state() != expected:
+                raise ValueError("Параметры источника изменились между развёртками")
+            if automatic and self.demo:
+                pin = context["rf_set_dbm"] - context["rf_loss_db"]
+                loss = 7 + max(0, pin + 15) * 0.2 + abs(context["lo_set_dbm"] - 13) * 0.05
+                output = (context["pin_dbm"] - 45 if injection_port(context["method"]) == "LO" else
+                    context["pin_dbm"] - 55 if context["method"] in ISOLATION_PORTS else pin - loss)
+                shift = output - context["output_loss_db"] + 27
+                spectrum["power_dbm"] = [max(-105, power + shift) for power in spectrum["power_dbm"]]
+            spectrum["context"] = dict(context)
+            if expected:
+                spectrum["generator"] = expected
+            spectra.append(spectrum)
+        return average_spectra(spectra, context)
 
     def notify_generator(self, state, known=True):
         self.generator_state.emit(dict(known=known, state=state, demo=self.demo,
@@ -135,19 +169,12 @@ class RsaWorker(QtCore.QThread):
                     if driver and config != current_config:
                         configured_settings = driver.configure(config)
                         current_config = config
-                spectrum = (demo_spectrum(config) if self.demo else
-                            driver.read_current() if self.operation == "read" else driver.acquire(self.stop))
+                context.update(series_id=series_id, series_index=index)
+                spectrum = self.capture(driver, config, context, automatic, smu, generator)
                 if automatic and configured_settings and spectrum["settings"] != configured_settings:
                     raise ValueError("Настройки RSA изменились после настройки серии; спектр не принят")
                 if automatic and smu and smu.state() != generator:
                     raise ValueError("Параметры/выходы SMU изменились во время развёртки; спектр не принят")
-                if automatic and self.demo:
-                    pin = context["rf_set_dbm"] - context["rf_loss_db"]
-                    loss = 7 + max(0, pin + 15) * 0.2 + abs(context["lo_set_dbm"] - 13) * 0.05
-                    output = (context["pin_dbm"] - 45 if injection_port(context["method"]) == "LO" else
-                              context["pin_dbm"] - 55 if context["method"] in ISOLATION_PORTS else pin - loss)
-                    shift = output - context["output_loss_db"] + 27
-                    spectrum["power_dbm"] = [max(-105, power + shift) for power in spectrum["power_dbm"]]
                 context.update(series_id=series_id, series_index=index)
                 spectrum["context"] = context
                 if generator:
@@ -222,6 +249,12 @@ class RsaWindow(QtWidgets.QWidget):
         self.stop_pending = False
         self.cleanup_error = None
         self.showing_series = False
+        self.marker_index = None
+        self.archive_worker = None
+        self.archive_loading = False
+        self.archive_generation = 0
+        self.archive_reload_pending = False
+        self.archive_rows = []
         self.column_filters = {}
         self.fields = {}
         self.build()
@@ -258,6 +291,16 @@ class RsaWindow(QtWidgets.QWidget):
         self.charts.restore(settings.get("chart", {}))
         self.two_tone.restore(settings.get("two_tone", {}))
         self.views.setCurrentIndex(settings.get("view_tab", 0) if settings.get("view_tab", 0) in (0, 1, 2) else 0)
+        for key, splitter in (("panels_sizes", self.panels_splitter), ("archive_sizes", self.archive_splitter)):
+            sizes = settings.get(key)
+            if isinstance(sizes, list) and len(sizes) == 2 and all(type(size) is int and size > 0 for size in sizes):
+                self.splitter_sizes[key] = list(sizes)
+                splitter.setSizes(sizes)
+        self.setup_panel_widths["0"] = self.splitter_sizes["panels_sizes"][0]
+        self.setup_panel_widths.update({key: width for key, width in settings.get("setup_panel_widths", {}).items()
+            if key in ("0", "1", "2") and type(width) is int and width > 0})
+        self.setup_tabs.currentChanged.connect(self.apply_setup_panel_width)
+        QtCore.QTimer.singleShot(0, self.apply_setup_panel_width)
         self.reload()
 
     def field(self, key, label, widget, form):
@@ -282,25 +325,56 @@ class RsaWindow(QtWidgets.QWidget):
     def button(self, label, slot, layout):
         widget = QtWidgets.QPushButton(label)
         widget.clicked.connect(slot)
-        layout.addWidget(widget)
+        if isinstance(layout, QtWidgets.QFormLayout):
+            widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
+            layout.addRow(widget)
+        else:
+            layout.addWidget(widget)
         return widget
 
     def build(self):
         layout = QtWidgets.QVBoxLayout(self)
+        heading_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(heading_row)
         heading = QtWidgets.QLabel("СМЕСИТЕЛИ · RF измерения")
         heading.setStyleSheet("font-size:22px; font-weight:700")
-        layout.addWidget(heading)
+        heading_row.addWidget(heading)
+        diagnostics = QtWidgets.QWidget()
+        diagnostics_layout = QtWidgets.QVBoxLayout(diagnostics)
+        diagnostics_layout.setContentsMargins(12, 0, 8, 0)
+        diagnostics_layout.setSpacing(2)
+        heading_row.addWidget(diagnostics, 1)
         self.notice = QtWidgets.QLabel()
         self.notice.setWordWrap(True)
-        layout.addWidget(self.notice)
+        self.notice.setStyleSheet("font-size:9pt; color:#9eacbe")
+        diagnostics_layout.addWidget(self.notice)
         self.smu_status = QtWidgets.QLabel("SMU: состояние не опрошено · подключение только по кнопке")
         self.smu_status.setWordWrap(True)
-        layout.addWidget(self.smu_status)
+        self.smu_status.setStyleSheet("font-size:9pt")
+        diagnostics_layout.addWidget(self.smu_status)
+        self.measure_button = QtWidgets.QPushButton("Измерить")
+        self.measure_button.setMinimumWidth(125)
+        self.measure_button.setStyleSheet("""
+            QPushButton
+            {
+                background: #17645f;
+                color: white;
+                font-weight: 700;
+                padding: 7px 15px;
+            }
+            QPushButton:disabled
+            {
+                background: #26384c;
+                color: #607087;
+            }
+        """)
+        self.measure_button.setToolTip("Запустить одиночное измерение; на вкладке «Два тона» — выполнить её задание")
+        self.measure_button.clicked.connect(self.start_from_header)
+        heading_row.addWidget(self.measure_button)
         body = QtWidgets.QHBoxLayout()
         layout.addLayout(body, 1)
         self.form_panel = QtWidgets.QWidget()
-        self.form_panel.setMinimumWidth(350)
-        self.form_panel.setMaximumWidth(430)
+        self.form_panel.setMinimumWidth(300)
         panel_layout = QtWidgets.QVBoxLayout(self.form_panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
         self.setup_tabs = QtWidgets.QTabWidget()
@@ -315,7 +389,11 @@ class RsaWindow(QtWidgets.QWidget):
             scroll.setWidget(page)
             self.setup_tabs.addTab(scroll, label)
         left, generator_layout, analyzer_layout = pages
-        body.addWidget(self.form_panel)
+        self.panels_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.panels_splitter.setChildrenCollapsible(False)
+        self.panels_splitter.setHandleWidth(8)
+        body.addWidget(self.panels_splitter)
+        self.panels_splitter.addWidget(self.form_panel)
         connection = QtWidgets.QGroupBox("Связь и отдельная БД смесителей")
         form = QtWidgets.QFormLayout(connection)
         self.field("demo", "Демонстрация", QtWidgets.QCheckBox("Синтетические спектры"), form)
@@ -339,7 +417,7 @@ class RsaWindow(QtWidgets.QWidget):
         self.field("method", "Измерение", self.combo(METHOD_CHOICES), form)
         self.field("pin_dbm", "Уровень на входе, dBm", self.spin(-20, -140, 30), form)
         self.field("pin_known", "Уровень", QtWidgets.QCheckBox("Известен на порту смесителя"), form)
-        self.field("output_loss_db", "Ослабление до RSA, дБ", self.spin(0, 0, 100), form)
+        self.field("output_loss_db", RSA_ATTENUATION, self.spin(0, 0, 100), form)
         self.field("path_known", "Выходной тракт", QtWidgets.QCheckBox("Поправка проверена на частоте маркера"), form)
         self.field("marker_window_hz", "Поиск пика ±, Гц", self.spin(3000, 1, 1e8, 0), form)
         self.wiring = QtWidgets.QLabel()
@@ -358,17 +436,18 @@ class RsaWindow(QtWidgets.QWidget):
         self.field("lo_channel", "LO", self.combo(channels), form)
         self.field("rf_dbm", "RF / IF на выходе, dBm", self.spin(-20, -145, 20), form)
         self.field("lo_dbm", "LO на выходе, dBm", self.spin(13, -145, 20), form)
-        self.field("rf_loss_db", "Потери RF-тракта, дБ", self.spin(0, 0, 100), form)
-        self.field("lo_loss_db", "Потери LO-тракта, дБ", self.spin(0, 0, 100), form)
-        self.field("if_loss_db", "Потери ввода IF, дБ", self.spin(0, 0, 100), form)
-        self.field("source_path_known", "Поправки входов", QtWidgets.QCheckBox("Потери RF/LO проверены"), form)
-        self.field("settling_s", "Установление, с", self.spin(0.2, 0, 10), form)
+        self.field("rf_loss_db", "Ослабление RF-тракта, дБ", self.spin(0, 0, 100), form)
+        self.field("lo_loss_db", "Ослабление LO-тракта, дБ", self.spin(0, 0, 100), form)
+        self.field("if_loss_db", "Ослабление ввода IF, дБ", self.spin(0, 0, 100), form)
+        self.field("source_path_known", "Поправки входов", QtWidgets.QCheckBox("Ослабления RF/LO проверены"), form)
+        self.field("settling_s", SETTLING_TIME, self.spin(0.2, 0, 10), form)
         self.button("Связь / состояние SMU", lambda: self.launch("smu_identify"), form)
         self.button("Применить CW · выходы OFF", lambda: self.launch("smu_apply"), form)
         self.button("Включить по схеме измерения", lambda: self.launch("smu_on"), form)
         self.button("Отключить оба выхода SMU", lambda: self.launch("smu_off"), form)
         generator_layout.addWidget(generator)
-        second_generator = QtWidgets.QGroupBox("АКИП-3208 / SSG3000X · LO двухтонового теста")
+        second_generator = QtWidgets.QGroupBox("АКИП-3208 / SSG3000X · LO")
+        second_generator.setToolTip("Источник LO для двухтонового измерения смесителя")
         form = QtWidgets.QFormLayout(second_generator)
         self.field("akip_host", "IP АКИП", QtWidgets.QLineEdit("172.16.236.190"), form)
         akip_port = QtWidgets.QSpinBox()
@@ -399,6 +478,13 @@ class RsaWindow(QtWidgets.QWidget):
         self.field("points", "Точек", count, form)
         self.field("detector", "Детектор", self.combo([("Положительный пик", "POS"),
             ("Нормальный", "NORM"), ("RMS", "RMS"), ("Выборка", "SAMP")]), form)
+        averages = QtWidgets.QSpinBox()
+        averages.setRange(1, 50)
+        averages.setValue(5)
+        self.field("sweep_averages", "Развёрток на точку", averages, form)
+        averages.setToolTip("Независимые развёртки при неизменном источнике; усреднение мощности в линейных единицах. 1 — без усреднения. Все исходные трассы сохраняются.")
+        stable_cw = self.button("Устойчивое CW · RMS / 100 Гц / ×5", self.stable_cw_preset, form)
+        stable_cw.setToolTip("Устойчивое измерение CW: задаёт RMS-детектор, RBW/VBW 100 Гц и пять развёрток на точку.")
         self.button("Обзор вокруг ожидаемого тона", self.center_on_tone, form)
         self.button("Применить настройки RSA", lambda: self.launch("apply"), form)
         analyzer_layout.addWidget(analyzer)
@@ -428,7 +514,9 @@ class RsaWindow(QtWidgets.QWidget):
             form_layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
             form_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.views = QtWidgets.QTabWidget()
-        body.addWidget(self.views, 1)
+        self.panels_splitter.addWidget(self.views)
+        self.panels_splitter.setStretchFactor(1, 1)
+        self.panels_splitter.setSizes([400, 950])
         acquisition_page = QtWidgets.QWidget()
         right = QtWidgets.QVBoxLayout(acquisition_page)
         self.views.addTab(acquisition_page, "Измерение и архив")
@@ -443,11 +531,11 @@ class RsaWindow(QtWidgets.QWidget):
         self.button("Кривая серии", self.show_series_curve, tools)
         acquisition_row = QtWidgets.QHBoxLayout()
         right.addLayout(acquisition_row)
-        self.operation_buttons = []
+        self.operation_buttons = [self.measure_button]
         for label, operation, tooltip in (
             ("Считать трассу", "read", "Только чтение текущей Trace1; параметры RSA не меняются"),
-            ("Одиночное", "single", "Применить настройки слева и выполнить новую одиночную развёртку"),
-            ("Серия", "series", "Применить настройки слева и выполнить серию новых развёрток")):
+            ("Измерить один раз", "single", "Применить настройки слева и выполнить новую одиночную развёртку"),
+            ("Запустить серию", "series", "Применить настройки слева и выполнить серию новых развёрток")):
             button = self.button(label, lambda checked=False, operation=operation: self.launch(operation), acquisition_row)
             button.setToolTip(tooltip)
             self.operation_buttons.append(button)
@@ -455,16 +543,32 @@ class RsaWindow(QtWidgets.QWidget):
         self.label_axis("bottom", "Частота", "Hz", True)
         self.label_axis("left", "Уровень", "dBm", False)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
-        right.addWidget(self.plot, 3)
+        self.marker_label = QtWidgets.QLabel(self.plot.viewport())
+        self.marker_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.marker_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.marker_label.setStyleSheet("QLabel { background: #223247; color: #ffffff; border: 1px solid #f4bd61; border-radius: 5px; padding: 7px; }")
+        self.marker_label.hide()
+        self.plot.viewport().installEventFilter(self)
+        self.plot.getViewBox().sigRangeChanged.connect(self.update_marker_label)
+        self.archive_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.archive_splitter.setChildrenCollapsible(False)
+        self.archive_splitter.setHandleWidth(8)
+        right.addWidget(self.archive_splitter, 1)
+        spectrum_panel = QtWidgets.QWidget()
+        spectrum_layout = QtWidgets.QVBoxLayout(spectrum_panel)
+        spectrum_layout.setContentsMargins(0, 0, 0, 0)
+        spectrum_layout.addWidget(self.plot, 1)
+        self.archive_splitter.addWidget(spectrum_panel)
         self.marker_text = QtWidgets.QLabel("Наведите курсор на спектр: частота, уровень и разность относительно пика")
         self.marker_text.setWordWrap(True)
-        right.addWidget(self.marker_text)
+        spectrum_layout.addWidget(self.marker_text)
         self.plot.scene().sigMouseMoved.connect(self.move_marker)
         self.result = QtWidgets.QLabel()
         self.result.setWordWrap(True)
-        right.addWidget(self.result)
+        spectrum_layout.addWidget(self.result)
         tabs = QtWidgets.QTabWidget()
-        right.addWidget(tabs, 2)
+        self.archive_splitter.addWidget(tabs)
+        self.archive_splitter.setSizes([450, 300])
         archive = QtWidgets.QWidget()
         archive_layout = QtWidgets.QVBoxLayout(archive)
         self.search = QtWidgets.QLineEdit()
@@ -478,19 +582,24 @@ class RsaWindow(QtWidgets.QWidget):
         filter_row.addWidget(self.filter_count, 1)
         self.button("Сбросить фильтры", self.clear_archive_filters, filter_row)
         self.button("Графики по архиву", self.show_charts, filter_row)
+        self.archive_result_note = QtWidgets.QLabel()
+        self.archive_result_note.setWordWrap(True)
+        archive_layout.addWidget(self.archive_result_note)
         self.archive_headers = ["Смеситель", "Партия", "Тип / модель", "Дата UTC", "Режим", "RF, МГц", "LO, МГц",
-            "ПЧ, МГц", "RF / IF, dBm", "LO, dBm", "Результат, дБ", "Статус", "Примечание"]
+            "ПЧ, МГц", "RF / IF, dBm", "LO, dBm", "Результат, дБ", "Статус", "Примечание", "Причина / условия расчёта"]
         self.table = QtWidgets.QTableWidget(0, len(self.archive_headers))
+        self.table.setHorizontalHeader(FilterHeader(self.table))
         self.table.setHorizontalHeaderLabels(self.archive_headers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setResizeContentsPrecision(100)
         self.table.horizontalHeader().sectionClicked.connect(self.show_archive_filter)
         self.table.itemSelectionChanged.connect(self.show_selected)
         archive_layout.addWidget(self.table)
         row = QtWidgets.QHBoxLayout()
         archive_layout.addLayout(row)
-        self.button("Обновить", self.reload, row)
+        self.reload_button = self.button("Обновить", self.reload, row)
         self.button("Экспорт JSON…", self.export_json, row)
         self.button("Импорт JSON…", self.import_json, row)
         self.button("Восстановить", self.recover, row)
@@ -509,19 +618,49 @@ class RsaWindow(QtWidgets.QWidget):
         self.views.currentChanged.connect(lambda *args: self.settings_changed.emit(self.settings()))
         bottom = QtWidgets.QHBoxLayout()
         layout.addLayout(bottom)
-        self.status = QtWidgets.QLabel("Готов · подключение только по кнопке")
+        self.status = StatusLabel("Готов · подключение только по кнопке")
         self.status.setWordWrap(True)
         bottom.addWidget(self.status, 1)
         self.stop_button = self.button("СТОП / RF OFF", self.stop, bottom)
         self.stop_button.setEnabled(False)
+        self.splitter_sizes = dict(panels_sizes=[400, 950], archive_sizes=[450, 300])
+        self.setup_panel_widths = {"0": 400, "1": 340, "2": 330}
+        for key, splitter in (("panels_sizes", self.panels_splitter), ("archive_sizes", self.archive_splitter)):
+            splitter.setStyleSheet("QSplitter::handle { background: #30566a; } QSplitter::handle:hover { background: #45d7d0; }")
+            splitter.handle(1).setToolTip("Перетащите, чтобы изменить размер панелей")
+            splitter.splitterMoved.connect(lambda *args, key=key, splitter=splitter: self.save_splitter_sizes(key, splitter))
+
+        compact_inputs(self.form_panel)
+        self.feedback = FieldFeedback(self.fields)
+
+    def save_splitter_sizes(self, key, splitter):
+        self.splitter_sizes[key] = splitter.sizes()
+        if key == "panels_sizes":
+            self.setup_panel_widths[str(self.setup_tabs.currentIndex())] = splitter.sizes()[0]
+        self.settings_changed.emit(self.settings())
+
+    def apply_setup_panel_width(self, *args):
+        width = self.setup_panel_widths[str(self.setup_tabs.currentIndex())]
+        total = sum(self.panels_splitter.sizes())
+        if total > 0:
+            self.panels_splitter.setSizes([width, max(1, total - width)])
 
     def settings(self):
         return dict(setup_tab=self.setup_tabs.currentIndex(), view_tab=self.views.currentIndex(),
+                    setup_panel_widths=dict(self.setup_panel_widths),
+                    panels_sizes=list(self.splitter_sizes["panels_sizes"]), archive_sizes=list(self.splitter_sizes["archive_sizes"]),
                     archive_search=self.search.text(), archive_filters={str(key): sorted(values) for key, values in self.column_filters.items()},
                     chart=self.charts.settings(), two_tone=self.two_tone.settings(), **{key: (widget.isChecked() if isinstance(widget, QtWidgets.QCheckBox) else
                       widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else
                       widget.value() if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)) else
                       widget.text()) for key, widget in self.fields.items()})
+
+    def start_from_header(self):
+        if self.views.currentWidget() is self.two_tone:
+            self.two_tone.start()
+        else:
+            self.views.setCurrentIndex(0)
+            self.launch("single")
 
     def label_axis(self, name, text, units, auto_prefix):
         axis = self.plot.getAxis(name)
@@ -539,6 +678,7 @@ class RsaWindow(QtWidgets.QWidget):
         self.settings_changed.emit(self.settings())
         if self.sender() in (self.demo, self.database):
             self.current = None
+            self.hide_marker()
             self.plot.clear()
             self.result.clear()
             self.marker_text.clear()
@@ -649,7 +789,18 @@ class RsaWindow(QtWidgets.QWidget):
         try:
             self.center_mhz.setValue(self.target(self.context()) / 1e6)
         except Exception as error:
-            self.error(str(error))
+            self.error(error)
+
+    def stable_cw_preset(self):
+        self.detector.setCurrentIndex(self.detector.findData("RMS"))
+        self.rbw_hz.setCurrentIndex(self.rbw_hz.findData(100))
+        self.vbw_hz.setCurrentIndex(self.vbw_hz.findData(100))
+        self.span_khz.setValue(20)
+        self.points.setValue(801)
+        self.sweep_averages.setValue(5)
+        self.settling_s.setValue(max(0.3, self.settling_s.value()))
+        self.center_on_tone()
+        self.status.setText("Заполнен профиль CW: RMS, RBW/VBW 100 Гц, обзор 20 кГц, 5 развёрток. Приборы пока не перестроены.")
 
     def store(self):
         if self.demo.isChecked():
@@ -659,6 +810,9 @@ class RsaWindow(QtWidgets.QWidget):
         return SpectrumStore(self.database.text(), False)
 
     def launch(self, operation):
+        if getattr(self.window(), "detector_busy", lambda: False)():
+            self.status.setText("Сначала завершите калибровку детектора и подтвердите RF OFF")
+            return
         if self.worker or self.two_tone.worker or self.two_tone.unsafe_outputs:
             return
         try:
@@ -691,7 +845,7 @@ class RsaWindow(QtWidgets.QWidget):
             count = sequence_count(source_settings, self.series_count.value()) if source_settings and operation == "series" else (
                 self.series_count.value() if operation == "series" else 1)
             self.worker = RsaWorker(self.host.text().strip(), job_demo, operation, config, context,
-                count, self.interval_s.value(), self, source_settings)
+                count, self.interval_s.value(), self, source_settings, self.sweep_averages.value())
             self.worker.log.connect(self.log.appendPlainText)
             self.worker.status.connect(self.status.setText)
             self.worker.failed.connect(self.error)
@@ -725,6 +879,7 @@ class RsaWindow(QtWidgets.QWidget):
             self.error(f"Не удалось сохранить спектр: {error}\nРезерв: {recovery}")
 
     def display(self, spectrum):
+        self.hide_marker()
         self.current = spectrum
         self.showing_series = False
         self.label_axis("bottom", "Частота", "Hz", True)
@@ -745,6 +900,9 @@ class RsaWindow(QtWidgets.QWidget):
             item.hide()
         peak = max(range(len(power)), key=power.__getitem__)
         self.marker_text.setText(f"Пик: {hz[peak] / 1e6:.6f} МГц · {power[peak]:.3f} dBm")
+        if spectrum.get("averaging"):
+            average = spectrum["averaging"]
+            self.marker_text.setText(self.marker_text.text() + f" · Усреднение {average['count']} развёрток; σ пика {average['marker_std_db']:.3f} дБ")
         self.plot.setTitle(("ДЕМО · " if spectrum["demo"] else "RSA6265 · ") + spectrum.get("context", {}).get("sample", ""))
         self.plot.enableAutoRange()
         self.analyze(spectrum)
@@ -823,6 +981,7 @@ class RsaWindow(QtWidgets.QWidget):
                 self.error("Нет расчётных точек комплексной проверки для выбранной RF")
                 return
             self.showing_series = True
+            self.hide_marker()
             self.plot.clear()
             legend = self.plot.getPlotItem().legend or self.plot.addLegend()
             legend.clear()
@@ -849,8 +1008,9 @@ class RsaWindow(QtWidgets.QWidget):
         if not points:
             self.error("В серии нет расчётных точек: проверьте флажки калибровки и условия измерений")
             return
-        points.sort()
+        points.sort(key=lambda point: (point[1], point[0]))
         self.showing_series = True
+        self.hide_marker()
         self.plot.clear()
         self.label_axis("bottom", "RF" if kind == "rf_frequency" else "Pin RF" if kind == "rf_power" else "Уровень LO",
                         "Hz" if kind == "rf_frequency" else "dBm", kind == "rf_frequency")
@@ -861,7 +1021,8 @@ class RsaWindow(QtWidgets.QWidget):
         self.marker_text.setText(f"Расчётных точек: {len(points)}. Для возврата к спектру выберите запись архива.")
 
     def move_marker(self, position):
-        if self.current is None or self.showing_series or not self.plot.sceneBoundingRect().contains(position):
+        if self.current is None or self.showing_series or not self.plot.getViewBox().sceneBoundingRect().contains(position):
+            self.hide_marker()
             return
         mapped = self.plot.getViewBox().mapSceneToView(position)
         hz, power = self.frequency_axis, self.current["power_dbm"]
@@ -870,44 +1031,156 @@ class RsaWindow(QtWidgets.QWidget):
         self.cross_y.setPos(power[index])
         self.cross_x.show()
         self.cross_y.show()
+        self.marker_index = index
+        self.marker_label.setText(f"Точка: {index + 1} / {len(hz)}\nЧастота: {hz[index] / 1e6:.6f} МГц\nУровень: {power[index]:.3f} dBm")
+        self.marker_label.adjustSize()
+        self.marker_label.show()
+        self.marker_label.raise_()
+        self.update_marker_label()
         self.marker_text.setText(f"Маркер: {hz[index] / 1e6:.6f} МГц · {power[index]:.3f} dBm · "
                                  f"от пика {power[index] - self.peak_power:.3f} дБ")
 
+    def update_marker_label(self, *args):
+        if self.marker_index is None or self.current is None or self.showing_series:
+            return
+        index = self.marker_index
+        point = QtCore.QPointF(self.frequency_axis[index], self.current["power_dbm"][index])
+        position = self.plot.mapFromScene(self.plot.getViewBox().mapViewToScene(point))
+        viewport = self.plot.viewport()
+        width, height = self.marker_label.width(), self.marker_label.height()
+        gap = 18
+        left = position.x() + gap
+        if left + width > viewport.width() - 4:
+            left = position.x() - width - gap
+        top = position.y() - height - gap
+        if top < 4:
+            top = position.y() + gap
+        left = max(4, min(left, viewport.width() - width - 4))
+        top = max(4, min(top, viewport.height() - height - 4))
+        self.marker_label.move(left, top)
+
+    def hide_marker(self):
+        self.marker_index = None
+        if hasattr(self, "marker_label"):
+            self.marker_label.hide()
+        for name in ("cross_x", "cross_y"):
+            if hasattr(self, name):
+                getattr(self, name).hide()
+
+    def eventFilter(self, watched, event):
+        if watched is self.plot.viewport() and event.type() in (QtCore.QEvent.Type.Leave, QtCore.QEvent.Type.Hide):
+            self.hide_marker()
+        return super().eventFilter(watched, event)
+
     def reload(self):
+        if self.archive_loading:
+            self.archive_reload_pending = True
+            return
         try:
-            self.spectra = self.store().load()
-            blocker = QtCore.QSignalBlocker(self.table)
-            self.table.setRowCount(len(self.spectra))
-            method_labels = {key: label for label, key in METHOD_CHOICES}
-            method_labels.update(two_tone_pa="PA · два тона", two_tone_mixer="Смеситель · два тона", harmonic_pa="PA · гармоническая полоса")
-            for row, spectrum in enumerate(self.spectra):
-                context = spectrum.get("context", {})
-                result = mixer_result(spectrum)
-                method = context.get("method", "spectrum")
-                values = [context.get("sample", ""), context.get("batch", ""), context.get("model", ""),
-                          spectrum["measured_at"][:19], method_labels.get(method, method),
-                          f"{context.get('rf_hz', 0) / 1e6:.6f}", f"{context.get('lo_hz', 0) / 1e6:.6f}", f"{context.get('if_hz', 0) / 1e6:.6f}",
-                          f"{context['rf_actual_dbm']:.3f}" if "rf_actual_dbm" in context else "",
-                          f"{context['lo_actual_dbm']:.3f}" if "lo_actual_dbm" in context else "",
-                          f"{result['value_db']:.3f}" if result.get("value_db") is not None else "—",
-                          {"preliminary": "Предварительно", "not_calculated": "Нет расчёта", "spectrum_only": "Спектр"}[result["status"]],
-                          context.get("notes", "")]
-                for column, value in enumerate(values):
-                    self.table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
-            self.table.clearSelection()
-            self.filter_archive()
-            del blocker
+            store = self.store()
+            self.archive_generation += 1
+            generation = self.archive_generation
+            if store.count() <= 200:
+                spectra = store.load()
+                self.begin_archive_rows((spectra, archive_rows(spectra)), generation, store, asynchronous=False)
+                return
+            self.archive_loading = True
+            self.archive_reload_pending = False
+            self.reload_button.setEnabled(False)
+            self.table.setEnabled(False)
+            self.filter_count.setText("Чтение архива в фоне…")
+            worker = ArchiveLoader(store, self)
+            self.archive_worker = worker
+            worker.ready.connect(lambda payload: self.begin_archive_rows(payload, generation, store))
+            worker.failed.connect(self.archive_failed)
+            worker.finished.connect(lambda: self.archive_thread_finished(worker))
+            worker.start()
         except Exception as error:
-            self.spectra = []
-            self.table.setRowCount(0)
-            self.error(str(error))
+            self.archive_failed(str(error))
+
+    def archive_thread_finished(self, worker):
+        if self.archive_worker is worker:
+            self.archive_worker = None
+        worker.deleteLater()
+
+    def begin_archive_rows(self, payload, generation, store, asynchronous=True):
+        if generation != self.archive_generation:
+            return
+        current = self.store()
+        if (current.path, current.demo) != (store.path, store.demo):
+            self.archive_loading = False
+            self.reload()
+            return
+        self.archive_loading = True
+        self.spectra, self.archive_rows = payload
+        blocker = QtCore.QSignalBlocker(self.table)
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(self.spectra))
+        del blocker
+        self.add_archive_batch(0, generation, asynchronous)
+
+    def add_archive_batch(self, start, generation, asynchronous):
+        if generation != self.archive_generation:
+            return
+        stop = min(start + (100 if asynchronous else len(self.archive_rows)), len(self.archive_rows))
+        blocker = QtCore.QSignalBlocker(self.table)
+        self.table.setUpdatesEnabled(False)
+        try:
+            for row in range(start, stop):
+                values, missing = self.archive_rows[row]
+                for column, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    if column in (10, 11, 13):
+                        item.setToolTip(values[13])
+                        if missing:
+                            item.setForeground(QtGui.QColor("#f4bd61"))
+                    self.table.setItem(row, column, item)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            del blocker
+        if stop < len(self.archive_rows):
+            self.filter_count.setText(f"Заполнение таблицы: {stop} / {len(self.archive_rows)}")
+            QtCore.QTimer.singleShot(0, lambda: self.add_archive_batch(stop, generation, asynchronous))
+            return
+        self.table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        for column in range(self.table.columnCount()):
+            self.table.setColumnWidth(column, min(360, self.table.columnWidth(column)))
+        self.table.setColumnWidth(13, 360)
+        missing = sum(row[1] for row in self.archive_rows)
+        self.archive_result_note.setText(f"Без расчёта: {missing}. Причина указана в последнем столбце и в подсказке статуса; "
+            "выберите строку для подробностей." if missing else "")
+        self.archive_result_note.setVisible(bool(missing))
+        self.table.clearSelection()
+        self.archive_loading = False
+        self.table.setEnabled(True)
+        self.reload_button.setEnabled(True)
+        self.filter_archive()
+        if self.archive_reload_pending:
+            self.archive_reload_pending = False
+            QtCore.QTimer.singleShot(0, self.reload)
+
+    def archive_failed(self, message):
+        self.archive_loading = False
+        self.table.setEnabled(True)
+        self.reload_button.setEnabled(True)
+        self.filter_count.setText("Не удалось обновить архив")
+        self.error(message)
+
+    def cancel_archive(self):
+        self.archive_generation += 1
+        self.archive_loading = False
+        self.archive_reload_pending = False
+        if self.archive_worker:
+            self.archive_worker.requestInterruption()
 
     def filter_archive(self):
+        if self.archive_loading:
+            return
         search = self.search.text().strip().casefold()
         visible = 0
         blocker = QtCore.QSignalBlocker(self.table)
         for row in range(self.table.rowCount()):
-            values = [self.table.item(row, column).text() for column in range(self.table.columnCount())]
+            values = self.archive_rows[row][0]
             matches = (not search or any(search in value.casefold() for value in values)) and all(
                 values[column] in selected for column, selected in self.column_filters.items())
             self.table.setRowHidden(row, not matches)
@@ -919,11 +1192,14 @@ class RsaWindow(QtWidgets.QWidget):
             self.table.horizontalHeaderItem(column).setText(label + (" ● ▼" if column in self.column_filters else " ▼"))
             self.table.horizontalHeaderItem(column).setToolTip("Выбрать значения · " + label)
         self.filter_count.setText(f"Показано: {visible} / {self.table.rowCount()}")
+        self.table.horizontalHeader().set_active_filters(self.column_filters)
         del blocker
         self.charts.invalidate()
         self.settings_changed.emit(self.settings())
 
     def show_archive_filter(self, column):
+        if self.archive_loading:
+            return
         from .ui import ColumnFilterDialog
 
         values = sorted({self.table.item(row, column).text() for row in range(self.table.rowCount())}, key=str.casefold)
@@ -942,6 +1218,8 @@ class RsaWindow(QtWidgets.QWidget):
         self.filter_archive()
 
     def chart_spectra(self, selected=False):
+        if self.archive_loading:
+            return []
         indices = {item.row() for item in self.table.selectionModel().selectedRows()} if selected else range(self.table.rowCount())
         return [self.spectra[index] for index in sorted(indices) if not self.table.isRowHidden(index)]
 
@@ -959,6 +1237,8 @@ class RsaWindow(QtWidgets.QWidget):
         self.stop_button.setEnabled(busy or self.generator_active)
 
     def show_selected(self):
+        if self.archive_loading:
+            return
         self.charts.invalidate()
         rows = self.table.selectionModel().selectedRows()
         if rows and not self.table.isRowHidden(rows[0].row()):
@@ -1101,6 +1381,8 @@ class RsaWindow(QtWidgets.QWidget):
             self.stop_pending = False
 
     def error(self, message):
+        self.feedback.show(message)
+        message = str(message)
         self.last_error = message
         if self.worker is not None and self.generator_active:
             self.stop_pending = True

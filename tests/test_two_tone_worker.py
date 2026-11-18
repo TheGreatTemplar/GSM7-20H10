@@ -34,6 +34,14 @@ class FakeAnalyzer:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_initial_connection_failure_does_not_lock_ui_as_if_rf_was_enabled(self):
+        worker = TwoToneWorker(None, dict(demo=False, akip_host="127.0.0.1", akip_port=5025), [])
+        states = []
+        worker.outputs.connect(states.append)
+        with patch("gsmbench.two_tone_ui.Ssg3000x", side_effect=TimeoutError("offline")):
+            worker.run()
+        self.assertEqual(states[-1], dict(known=False, active=False, requires_off=False))
+
     def run_worker(self, directory, plans, fail=False, stop=False, bad_level=False):
         smu, smu_device = make_driver()
         akip, akip_device = make_ssg()

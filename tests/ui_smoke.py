@@ -21,6 +21,21 @@ with tempfile.TemporaryDirectory() as directory:
     ui.ROOT = Path(directory)
     ui.SETTINGS = ui.ROOT / "settings.local.json"
     window = ui.Window()
+    dialog = ui.ColumnFilterDialog("Частота", ["1.850000", "3.650000", "14.150000"], {"3.650000"}, window)
+    dialog.show()
+    dialog.search.setText("3.65")
+    dialog.clear_all.click()
+    assert dialog.selected_values() == set()
+    dialog.select_all.click()
+    assert len(dialog.selected_values()) == 3, "Select all ignored hidden search results"
+    dialog.clear_all.click()
+    dialog.check_visible(True)
+    assert dialog.selected_values() == {"3.650000"}
+    assert dialog.select_all.checkState() == QtCore.Qt.CheckState.PartiallyChecked
+    app.processEvents()
+    Path(".scratch").mkdir(exist_ok=True)
+    dialog.grab().save(".scratch/filter-dialog-preview.png")
+    dialog.close()
     errors = []
     window.error = errors.append
     window.show()
@@ -38,14 +53,16 @@ with tempfile.TemporaryDirectory() as directory:
     window.help_action.trigger()
     app.processEvents()
     assert window.help_dialog.isVisible()
-    assert window.help_dialog.tabs.count() == 12
-    mixer_help = window.help_dialog.tabs.widget(5)
-    assert window.help_dialog.tabs.tabText(5) == "Смеситель"
+    from gsmbench.help_ui import HELP_PAGES
+    assert window.help_dialog.tabs.count() == len(HELP_PAGES)
+    mixer_index = next(index for index in range(window.help_dialog.tabs.count())
+        if window.help_dialog.tabs.tabText(index) == "Смеситель")
+    mixer_help = window.help_dialog.tabs.widget(mixer_index)
     mixer_image = mixer_help.document().resource(QtGui.QTextDocument.ResourceType.ImageResource,
                                                QtCore.QUrl("gsmbench:mixer"))
     assert isinstance(mixer_image, QtGui.QImage) and not mixer_image.isNull()
     assert "VD017" in mixer_help.toPlainText()
-    window.help_dialog.tabs.setCurrentIndex(5)
+    window.help_dialog.tabs.setCurrentIndex(mixer_index)
     app.processEvents()
     window.help_dialog.grab().save(str(ui.ROOT / "help-preview.png"))
     window.help_dialog.close()
@@ -170,6 +187,7 @@ with tempfile.TemporaryDirectory() as directory:
     choose_column(2, {"Первая", "Вторая"})
     assert window.filter_count.text() == "Показано: 3 / 4"
     choose_column(1, {"КД419"})
+    assert window.table.horizontalHeader().active_filters == {1, 2}
     assert window.filter_count.text() == "Показано: 2 / 4"
     window.table.selectAll()
     assert {run["sample"] for run in window.selected()} == {"FILTER-A", "FILTER-B"}

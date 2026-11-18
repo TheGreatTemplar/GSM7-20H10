@@ -232,7 +232,7 @@ class SequenceWorkerTests(unittest.TestCase):
         options = dict(SETTINGS)
         if rf_limit == 0:
             options.update(sweep_kind="rf_power", sweep_start=-20, sweep_stop=10)
-        worker = RsaWorker("127.0.0.1", False, "series", AnalyzerConfig(), CONTEXT, 3, 0, None, options)
+        worker = RsaWorker("127.0.0.1", False, "series", AnalyzerConfig(), CONTEXT, 3, 0, None, options, averages=3)
         spectra, errors, states = [], [], []
         worker.spectrum.connect(spectra.append)
         worker.failed.connect(errors.append)

@@ -18,6 +18,11 @@ from .rsa import AcquisitionCancelled, Rsa6265, demo_spectrum, frequencies
 from .smu import Smu200a, SourcePlan, verified_off
 from .ssg import Ssg3000x, verified_ssg_off
 from .two_tone import TwoTonePlan, analyze_two_tone, harmonic_band
+from .source_calibration import PowerCalibrationWorker, calibrated_source_plan
+from .source_calibration_ui import PowerCalibrationPanel
+from .form_layout import compact_inputs
+from .validation import FieldError, FieldFeedback, StatusLabel
+from .rf_labels import INPUT_ATTENUATION_A, INPUT_ATTENUATION_B, INPUT_ATTENUATION_HINT, RSA_ATTENUATION, SMU_LEVEL
 
 
 class TwoToneWorker(QtCore.QThread):
@@ -35,6 +40,7 @@ class TwoToneWorker(QtCore.QThread):
     def run(self):
         smu, akip, rsa = None, None, None
         owns = self.operation in ("measure", "off")
+        enable_attempted = False
         series = str(uuid.uuid4())
         try:
             if not self.settings["demo"]:
@@ -45,6 +51,9 @@ class TwoToneWorker(QtCore.QThread):
                     self.outputs.emit(dict(known=True, active=bool(state["output"])))
                     return
                 smu = Smu200a(self.settings["smu_host"], self.settings["smu_port"], self.log.emit)
+                profile = self.settings.get("power_calibration")
+                if self.operation == "measure" and profile and smu.identity != profile["generator_identity"]:
+                    raise ValueError("Профиль калибровки снят другим SMU; паспорт прибора не совпадает")
                 smu.all_off()
                 akip.off()
             if self.operation in ("off", "identify"):
@@ -81,6 +90,7 @@ class TwoToneWorker(QtCore.QThread):
                     generator = smu.setpoint(self.source_plan(plan))
                     generator2 = akip.setpoint(plan.lo_hz, plan.lo_dbm) if plan.mode == "mixer" else akip.state()
                     if not active:
+                        enable_attempted = True
                         if plan.mode == "mixer":
                             generator2 = akip.enable(self.stop)
                         generator = smu.enable((1, 2), self.stop)
@@ -105,6 +115,20 @@ class TwoToneWorker(QtCore.QThread):
                     sources="SMU200A A+B; AKIP3208 LO" if plan.mode == "mixer" else "SMU200A A+B; AKIP3208 OFF",
                     source_layout="smu_ab_akip_lo", tone1_channel=1, tone2_channel=2,
                     rf_channel=1, lo_source="AKIP3208" if plan.mode == "mixer" else None, sweep_kind="two_tone_power")
+                if self.settings.get("power_calibration"):
+                    profile = self.settings["power_calibration"]
+                    context["source_calibration"] = dict(id=profile["id"], method=profile["plan"]["method"],
+                        path=profile["path"], created_at=profile["created_at"], meter_identity=profile["meter_identity"],
+                        commands=asdict(self.source_plan(plan)), tolerance_db=profile["plan"]["tolerance_db"],
+                        points=[point for point in profile["points"] if any(math.isclose(point["target_dbm"], target,
+                            abs_tol=1e-6, rel_tol=0) for target in (plan.level1_dbm - plan.loss1_db, plan.level2_dbm - plan.loss2_db))])
+                    context["source_calibration"]["frequency_profiles"] = [dict(id=item["id"],
+                        f1_hz=item["plan"]["f1_hz"], f2_hz=item["plan"]["f2_hz"], meter_identity=item["meter_identity"],
+                        points=[point for point in item["points"] if any(math.isclose(point["target_dbm"], target,
+                            abs_tol=1e-6, rel_tol=0) for target in (plan.level1_dbm - plan.loss1_db, plan.level2_dbm - plan.loss2_db))])
+                        for item in self.settings.get("power_calibration_profiles", [])
+                        if any(math.isclose(item["plan"]["f1_hz"], hz, abs_tol=0.05, rel_tol=0)
+                            for hz in (plan.f1_hz, plan.f2_hz))]
                 if plan.mode == "mixer":
                     context["lo_actual_dbm"] = plan.lo_dbm
                 spectrum["context"], spectrum["generator"], spectrum["generator2"] = context, generator, generator2
@@ -155,9 +179,15 @@ class TwoToneWorker(QtCore.QThread):
                             errors.append(label + ": " + str(error))
                     elif not self.settings["demo"]:
                         errors.append(label + ": связь не установлена, OFF не подтверждён")
-                self.outputs.emit(dict(known=not errors, active=bool(errors)))
+                must_confirm_off = enable_attempted or self.operation == "off"
                 if errors:
+                    self.outputs.emit(dict(known=False, active=must_confirm_off, requires_off=must_confirm_off))
+                else:
+                    self.outputs.emit(dict(known=True, active=False))
+                if errors and must_confirm_off:
                     self.failed.emit("Отключение не подтверждено: " + "; ".join(errors))
+                elif errors:
+                    self.log.emit("RF не включался; ошибка связи не требует блокировки настроек.")
             for driver in (rsa, akip, smu):
                 if driver:
                     try:
@@ -166,6 +196,8 @@ class TwoToneWorker(QtCore.QThread):
                         self.failed.emit("Закрытие связи: " + str(error))
 
     def source_plan(self, plan):
+        if self.settings.get("power_calibration"):
+            return calibrated_source_plan(self.settings["power_calibration"], plan, self.settings)
         return SourcePlan(plan.f1_hz, plan.f2_hz, plan.level1_dbm, plan.level2_dbm, 1, 2)
 
     def capture(self, rsa, plan, order):
@@ -218,10 +250,14 @@ class TwoTonePanel(QtWidgets.QWidget):
         scroll.setMinimumWidth(300)
         scroll.setMaximumWidth(360)
         layout.addWidget(scroll)
-        right = QtWidgets.QVBoxLayout()
-        layout.addLayout(right, 1)
+        self.pages = QtWidgets.QTabWidget()
+        layout.addWidget(self.pages, 1)
+        measurement_page = QtWidgets.QWidget()
+        right = QtWidgets.QVBoxLayout(measurement_page)
+        self.pages.addTab(measurement_page, "Двухтоновые измерения")
         self.form_widget = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(self.form_widget)
+        self.form = form
         form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         scroll.setWidget(self.form_widget)
@@ -241,6 +277,7 @@ class TwoTonePanel(QtWidgets.QWidget):
             if not place:
                 return widget
             if isinstance(widget, QtWidgets.QCheckBox):
+                widget.setAccessibleName(label)
                 widget.setText("")
                 row = QtWidgets.QWidget()
                 row_layout = QtWidgets.QHBoxLayout(row)
@@ -264,29 +301,32 @@ class TwoTonePanel(QtWidgets.QWidget):
                 grid.addWidget(widget, 1, column)
                 grid.setColumnStretch(column, 1)
             form.addRow(group)
+            return group
 
         self.mode = QtWidgets.QComboBox()
         self.mode.addItem("PA · два тона и гармонические полосы", "pa")
         self.mode.addItem("Смеситель · два RF-тона и LO", "mixer")
         add("mode", "Объект", self.mode)
-        first = add("f1_mhz", "Первый тон, МГц", 14, 0.1, 60, 6, place=False)
+        first = add("f1_mhz", "Первый тон, МГц", 14, 0.1, 200, 6, place=False)
         level1 = add("level1", "Уровень первого тона, dBm", -20, -110, 20, place=False)
-        paired_row("Первый тон · SMU A/1", "Частота, МГц", first, "Уровень, dBm", level1)
+        paired_row("Первый тон · SMU A/1", "Частота, МГц", first, SMU_LEVEL, level1)
         self.f2_mhz = QtWidgets.QLineEdit()
         self.f2_mhz.setReadOnly(True)
         self.f2_mhz.setToolTip("Частота второго тона = первый тон + интервал. Измените первый тон или интервал ниже.")
         level2 = add("level2", "Уровень второго тона, dBm", -20, -110, 20, place=False)
-        paired_row("Второй тон · SMU B/2", "Частота, МГц", self.f2_mhz, "Уровень, dBm", level2)
+        paired_row("Второй тон · SMU B/2", "Частота, МГц", self.f2_mhz, SMU_LEVEL, level2)
         add("spacing_hz", "Интервал тонов, Гц", 2000, 100, 100000, 0)
         lo = add("lo_mhz", "LO для смесителя, МГц", 25.0592, 0.1, 3070, 6, place=False)
         lo_level = add("lo_dbm", "АКИП · уровень LO, dBm", 13, -110, 20, place=False)
-        paired_row("LO смесителя · АКИП", "Частота, МГц", lo, "Уровень, dBm", lo_level)
+        self.lo_group = paired_row("LO смесителя · АКИП", "Частота, МГц", lo, "Уровень, dBm", lo_level)
         first.valueChanged.connect(self.update_second_tone)
         self.fields["spacing_hz"].valueChanged.connect(self.update_second_tone)
         self.update_second_tone()
-        add("loss1", "Ослабление ввода тона 1, дБ", 6, 0, 100)
-        add("loss2", "Ослабление ввода тона 2, дБ", 6, 0, 100)
-        add("output_loss", "Ослабление до RSA, дБ", 40, 0, 100)
+        add("loss1", INPUT_ATTENUATION_A, 6, 0, 100)
+        add("loss2", INPUT_ATTENUATION_B, 6, 0, 100)
+        for key, channel in (("loss1", "A/1"), ("loss2", "B/2")):
+            self.fields[key].setToolTip(INPUT_ATTENUATION_HINT.format(channel=channel))
+        add("output_loss", RSA_ATTENUATION, 40, 0, 100)
         add("pad_rating", "Мощность первого аттенюатора, Вт", 10, 0, 100)
         add("max_w", "Предел средней мощности PA, Вт", 7, 0.01, 7)
         add("harmonics", "Гармонические полосы до H", 5, 1, 7, 0)
@@ -320,20 +360,40 @@ class TwoTonePanel(QtWidgets.QWidget):
         tools = QtWidgets.QHBoxLayout()
         right.addLayout(tools)
         for title, callback in (("Мощность и PEP", self.plot_power), ("IM3 и гармоники", self.plot_distortion),
+                                ("Сбросить масштаб", lambda: self.plot.enableAutoRange()),
                                 ("Из архива", self.load_archive), ("PNG…", self.export_png), ("CSV точек…", self.export_csv)):
             button = QtWidgets.QPushButton(title)
             button.clicked.connect(callback)
             tools.addWidget(button)
-        self.status = QtWidgets.QLabel("Данные пока не измерены. Пороговый вердикт не задаётся.")
+        self.status = StatusLabel("Данные пока не измерены. Пороговый вердикт не задаётся.")
         self.status.setWordWrap(True)
         self.summary = QtWidgets.QLabel()
         self.summary.setWordWrap(True)
         right.addWidget(self.summary)
         right.addWidget(self.status)
+        self.manual_off_button = QtWidgets.QPushButton("Подтвердить RF OFF обоих генераторов вручную")
+        self.manual_off_button.setToolTip("Только после физической проверки: оба выхода SMU и RF-выход АКИП отключены.")
+        self.manual_off_button.clicked.connect(self.confirm_manual_off)
+        self.manual_off_button.hide()
+        right.addWidget(self.manual_off_button)
+        self.calibration = PowerCalibrationPanel(self)
+        for key in ("loss1", "loss2"):
+            self.fields[key].valueChanged.connect(self.calibration.fields[key].setValue)
+            self.calibration.fields[key].valueChanged.connect(self.fields[key].setValue)
+            self.fields[key].valueChanged.connect(lambda: self.fields["wiring"].setChecked(False))
+        self.feedback = FieldFeedback(dict(self.bench.fields, **self.fields))
+        self.pages.addTab(self.calibration, "Калибровка уровней SMU")
+        self.calibration.changed.connect(lambda: self.settings_changed.emit())
+        for key in ("f1_mhz", "spacing_hz", "loss1", "loss2"):
+            self.fields[key].valueChanged.connect(lambda: self.calibration.confirm.setChecked(False))
+        self.bench.demo.toggled.connect(self.calibration.reload)
+        self.calibration.reload()
         self.mode_changed()
+        compact_inputs(self.form_widget)
 
     def settings(self):
-        return dict(source_layout="smu_ab_akip_lo", **{key: widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else
+        return dict(source_layout="smu_ab_akip_lo", power_calibration=self.calibration.settings(),
+            **{key: widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else
                 widget.isChecked() if isinstance(widget, QtWidgets.QCheckBox) else widget.value()
                 for key, widget in self.fields.items() if key != "wiring"})
 
@@ -358,18 +418,21 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.update_second_tone()
         if settings.get("source_layout") != "smu_ab_akip_lo":
             self.fields["calibrated"].setChecked(False)
+        self.calibration.restore(settings.get("power_calibration", {}))
 
     def mode_changed(self, *args, reset=True):
         pa = self.mode.currentData() == "pa"
         self.fields["lo_mhz"].setEnabled(not pa)
         self.fields["lo_dbm"].setEnabled(not pa)
+        self.form.setRowVisible(self.lo_group, not pa)
         for key in ("pad_rating", "max_w", "harmonics"):
             self.fields[key].setEnabled(pa)
+            self.form.setRowVisible(self.fields[key], pa)
         if reset:
             self.fields["output_loss"].setValue(40 if pa else 0)
         self.fields["wiring"].setChecked(False)
         self.wiring.setText("PA: SMU A/1 и B/2 → резистивный сумматор → PA → 20 дБ / 10 Вт → ещё 20 дБ → RSA. "
-            "АКИП выключен. Потери ввода 6 дБ — начальные номинальные значения, замените измеренными. "
+            "АКИП выключен. Ослабления трактов A/B включают кабели, аттенюаторы и комбинер. "
             "Гармоники означают максимум в полосе n·f1…n·f2, это не THD." if pa else
             "Смеситель: SMU A/1 и B/2 → сумматор → RF; АКИП → LO; IF → RSA. "
             "Собственные IM3 источников и сумматора нужно измерить без DUT для проверки динамического диапазона стенда.")
@@ -406,22 +469,48 @@ class TwoTonePanel(QtWidgets.QWidget):
         return result
 
     def start(self):
-        self.launch("measure")
+        self.launch("calibrate" if self.pages.currentIndex() == 1 else "measure")
 
     def launch(self, operation):
+        if getattr(self.window(), "detector_busy", lambda: False)():
+            self.status.setText("Сначала завершите калибровку детектора и подтвердите RF OFF")
+            return
         if self.worker:
             return
         try:
-            if self.bench.worker is not None or (operation == "measure" and self.bench.generator_active):
+            self.feedback.clear()
+            self.calibration.feedback.clear()
+            if self.bench.worker is not None or (operation in ("measure", "calibrate") and self.bench.generator_active):
                 raise ValueError("Сначала остановите основное измерение и отключите управляемые выходы SMU")
             plans = self.plans() if operation == "measure" else []
             if operation == "measure" and not self.bench.demo.isChecked() and not self.fields["wiring"].isChecked():
-                raise ValueError("Сначала подключите схему и подтвердите сумматор, нагрузку и выходные аттенюаторы")
+                raise FieldError("Сначала подключите схему и подтвердите сумматор, нагрузку и выходные аттенюаторы", "wiring")
             data = self.bench.settings()
             settings = dict(root=str(self.bench.root), database=str(self.bench.store().path), demo=data["demo"],
                 smu_host=data["smu_host"], smu_port=data["smu_port"], akip_host=data["akip_host"], akip_port=data["akip_port"],
                 rsa_host=data["host"], rf_channel=data["rf_channel"], lo_channel=data["lo_channel"],
                 sample=data["sample"], batch=data["batch"], model=data["model"], notes=data["notes"], settling_s=data["settling_s"])
+            calibration = self.calibration.settings()
+            settings.update(calibration_path=calibration["path"], nrp_resource=calibration["nrp_resource"],
+                nrp_averages=int(calibration["nrp_averages"]),
+                nrp_settling_s=calibration["nrp_settling_s"],
+                rsa_attenuation=int(self.bench.attenuation_db.value()), rsa_reference=self.bench.reference_dbm.value())
+            if operation == "measure" and calibration["use"]:
+                settings["power_calibration"] = self.calibration.profile_for_plan(plans[0])
+                settings["power_calibration_profiles"] = [profile for profile in self.calibration.available
+                    if profile.get("calibration_batch_id", profile["id"]) == settings["power_calibration"].get(
+                        "calibration_batch_id", settings["power_calibration"]["id"])]
+                for plan in plans:
+                    calibrated_source_plan(settings["power_calibration"], plan, settings)
+            if operation == "calibrate":
+                calibration_plan = self.calibration.plan()
+                if not calibration["path"]:
+                    raise FieldError("Укажите название тракта калибровки", "path")
+                if not data["demo"] and not self.calibration.confirm.isChecked():
+                    raise FieldError("Подтвердите в калибровке: DUT отключён, измеритель подключён вместо DUT, ослабления проверены", "confirm")
+                if calibration_plan.method == "nrp" and not calibration["nrp_resource"]:
+                    raise FieldError("Укажите VISA USB-ресурс NRP18T", "nrp_resource")
+                self.calibration.prepare_run()
             if operation == "off" and self.last_settings:
                 settings = self.last_settings
             if operation == "measure":
@@ -431,23 +520,40 @@ class TwoTonePanel(QtWidgets.QWidget):
             self.form_widget.setEnabled(False)
             self.start_button.setEnabled(False)
             self.preset.setEnabled(False)
+            self.calibration.set_busy(True)
             self.busy_changed.emit(True)
-            self.worker = TwoToneWorker(self, settings, plans, operation)
+            self.worker = (PowerCalibrationWorker(self, settings, calibration_plan) if operation == "calibrate"
+                else TwoToneWorker(self, settings, plans, operation))
             self.worker.log.connect(self.bench.log.appendPlainText)
             self.worker.status.connect(self.status.setText)
-            self.worker.failed.connect(lambda error: self.status.setText("ОШИБКА: " + error))
+            if operation == "calibrate":
+                self.worker.status.connect(self.calibration.status.setText)
+                self.worker.failed.connect(self.calibration.error)
+                self.worker.field_failed.connect(self.calibration.error)
+            self.worker.failed.connect(self.error)
             self.worker.outputs.connect(self.outputs_updated)
-            self.worker.point_ready.connect(self.received)
+            if operation == "calibrate":
+                self.worker.profile_ready.connect(self.calibration.received)
+            else:
+                self.worker.point_ready.connect(self.received)
             self.worker.finished.connect(self.finished)
             self.worker.start()
         except Exception as error:
-            self.status.setText("ОШИБКА: " + str(error))
+            self.error(error)
+            if operation == "calibrate" or getattr(error, "fields", ()) == ("profiles",):
+                self.pages.setCurrentIndex(1)
+                self.calibration.error(error)
+
+    def error(self, error):
+        self.status.setText("ОШИБКА: " + str(error))
+        self.feedback.show(error)
 
     def outputs_updated(self, state):
-        self.unsafe_outputs = not state["known"] or state["active"]
-        if self.worker and self.worker.operation in ("measure", "off") and not self.unsafe_outputs:
+        self.unsafe_outputs = state.get("requires_off", not state["known"] or state["active"])
+        if self.worker and self.worker.operation in ("measure", "off", "calibrate") and not self.unsafe_outputs and state["known"]:
             self.bench.generator_active = False
-            self.bench.smu_status.setText("SMU и АКИП: RF OFF подтверждён")
+            self.bench.smu_status.setText("SMU: RF OFF подтверждён; АКИП в калибровке не управлялся"
+                if self.worker.operation == "calibrate" else "SMU и АКИП: RF OFF подтверждён")
 
     def received(self, point):
         self.points.append(point)
@@ -464,15 +570,41 @@ class TwoTonePanel(QtWidgets.QWidget):
             self.launch("off")
 
     def finished(self):
+        calibrated = self.worker.operation == "calibrate"
+        calibration_summary = getattr(self.worker, "summary_text", None)
         self.worker.deleteLater()
         self.worker = None
         self.form_widget.setEnabled(not self.unsafe_outputs)
         self.start_button.setEnabled(not self.unsafe_outputs)
         self.preset.setEnabled(not self.unsafe_outputs)
+        self.calibration.set_busy(self.unsafe_outputs)
+        if calibrated:
+            profile = getattr(self.calibration, "current_profile", None)
+            self.calibration.reload()
+            if profile:
+                self.calibration.profiles.setCurrentIndex(self.calibration.profiles.findData(profile["id"]))
+                self.calibration.received(profile)
+            if calibration_summary:
+                self.calibration.status.setText(calibration_summary)
         self.busy_changed.emit(self.unsafe_outputs)
+        self.manual_off_button.setVisible(self.unsafe_outputs)
         self.bench.reload()
         if self.unsafe_outputs:
             self.status.setText("Отключение источников не подтверждено. Повторите СТОП / OFF и проверьте приборы.")
+
+    def confirm_manual_off(self):
+        if self.worker:
+            return
+        self.unsafe_outputs = False
+        self.bench.generator_active = False
+        self.form_widget.setEnabled(True)
+        self.start_button.setEnabled(True)
+        self.preset.setEnabled(True)
+        self.calibration.set_busy(False)
+        self.manual_off_button.hide()
+        self.busy_changed.emit(False)
+        self.status.setText("RF OFF обоих генераторов подтверждён пользователем; блокировка снята.")
+        self.bench.log.appendPlainText(self.status.text())
 
     def plot_power(self):
         self.plot.clear()

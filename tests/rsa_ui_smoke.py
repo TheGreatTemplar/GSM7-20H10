@@ -1,8 +1,10 @@
 """Offscreen RSA window check; temporary databases and synthetic RF only."""
 
 from pathlib import Path
+import copy
 import tempfile
 import time
+import uuid
 from unittest.mock import patch
 
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
@@ -31,6 +33,15 @@ with tempfile.TemporaryDirectory() as directory:
     main.show()
     main.rsa_action.trigger()
     window = main.rsa_window
+    assert window.measure_button.text() == "Измерить"
+    with patch.object(window, "launch") as launch:
+        window.measure_button.click()
+        launch.assert_called_once_with("single")
+    window.views.setCurrentWidget(window.two_tone)
+    with patch.object(window.two_tone, "start") as start:
+        window.measure_button.click()
+        start.assert_called_once()
+    window.views.setCurrentIndex(0)
     assert main.workspaces.currentWidget() is main.mixers_page
     assert not window.isWindow(), "Mixer controls opened a separate native window"
     assert [window.setup_tabs.tabText(i) for i in range(3)] == ["Измерения", "Генератор", "Анализатор"]
@@ -51,6 +62,13 @@ with tempfile.TemporaryDirectory() as directory:
         wait_worker(window)
     assert window.last_error is None, window.last_error
     assert len(window.spectra) == 1
+    assert window.spectra[0]["averaging"]["count"] == 5
+    assert len(window.spectra[0]["averaging"]["raw_sweeps"]) == 5
+    app.processEvents()
+    before_sizes = window.archive_splitter.sizes()
+    window.archive_splitter.moveSplitter(120, 1)
+    assert window.archive_splitter.sizes() != before_sizes
+    window.panels_splitter.moveSplitter(320, 1)
     assert "7.000" in window.result.text(), window.result.text()
     assert not (ui.ROOT / "data" / "mixers.db").exists()
     window.if_hz.setCurrentIndex(window.if_hz.findData(8192000))
@@ -71,6 +89,26 @@ with tempfile.TemporaryDirectory() as directory:
     position = window.plot.getViewBox().mapViewToScene(QtCore.QPointF(8192000, -27))
     window.move_marker(position)
     assert window.cross_x.isVisible() and "8.192000" in window.marker_text.text(), window.marker_text.text()
+    assert window.marker_label.isVisible()
+    assert f"Точка: {window.marker_index + 1} / 801" in window.marker_label.text()
+    assert "8.192000" in window.marker_label.text() and "-27.000 dBm" in window.marker_label.text()
+    QtTest.QTest.qWait(3100)
+    assert window.marker_label.isVisible(), "Spectrum label expired while the marker stayed still"
+    main.resize(1380, 900)
+    window.archive_splitter.moveSplitter(330, 1)
+    app.processEvents()
+    for fraction in (0.01, 0.99):
+        hz = window.frequency_axis[0] + fraction * (window.frequency_axis[-1] - window.frequency_axis[0])
+        position = window.plot.getViewBox().mapViewToScene(QtCore.QPointF(hz, -80))
+        window.move_marker(position)
+        assert window.plot.viewport().rect().contains(window.marker_label.geometry())
+        marker_point = window.plot.mapFromScene(window.plot.getViewBox().mapViewToScene(QtCore.QPointF(
+            window.frequency_axis[window.marker_index], window.current["power_dbm"][window.marker_index])))
+        assert not window.marker_label.geometry().contains(marker_point), "Label covers the spectrum point"
+    Path(".scratch").mkdir(exist_ok=True)
+    window.plot.grab().save(".scratch/spectrum-marker-preview.png")
+    app.sendEvent(window.plot.viewport(), QtCore.QEvent(QtCore.QEvent.Type.Leave))
+    assert not window.marker_label.isVisible() and not window.cross_x.isVisible()
     target = ui.ROOT / "spectrum.csv"
     with patch.object(QtWidgets.QFileDialog, "getSaveFileName", return_value=(str(target), "")):
         window.export_csv()
@@ -156,6 +194,7 @@ with tempfile.TemporaryDirectory() as directory:
     level_column = window.archive_headers.index("RF / IF, dBm")
     window.column_filters = {rf_column: {"3.650000", "14.150000"}, level_column: {"-30.000"}}
     window.filter_archive()
+    assert window.table.horizontalHeader().active_filters == {rf_column, level_column}
     assert len(window.chart_spectra(False)) == 4
     before = {key: set(values) for key, values in window.column_filters.items()}
     with patch("gsmbench.ui.ColumnFilterDialog") as dialog:
@@ -165,8 +204,10 @@ with tempfile.TemporaryDirectory() as directory:
     window.show_charts()
     window.charts.x_axis.setCurrentIndex(window.charts.x_axis.findData("rf_hz"))
     window.charts.y_axis.setCurrentIndex(window.charts.y_axis.findData("raw_loss"))
+    window.chart_spectra(False)[0]["averaging"]["marker_std_db"] = 0.025
     window.charts.build_chart()
     assert len(window.charts.groups) == 2, window.charts.status.text()
+    assert any(point["sweep_std_db"] > 0 for group in window.charts.groups for point in group["points"])
     assert all(len(group["points"]) == 2 for group in window.charts.groups)
     chart_csv, chart_png = ui.ROOT / "chart.csv", ui.ROOT / "chart.png"
     with patch.object(QtWidgets.QFileDialog, "getSaveFileName", return_value=(str(chart_csv), "")):
@@ -200,6 +241,16 @@ with tempfile.TemporaryDirectory() as directory:
     assert main.isVisible()
     wait_worker(window)
     window.series_count.setValue(3)
+    unconfirmed = copy.deepcopy(window.spectra[0])
+    unconfirmed["id"] = str(uuid.uuid4())
+    unconfirmed["context"].update(pin_known=False, path_known=False)
+    window.store().save_many([unconfirmed])
+    window.reload()
+    row = next(index for index, item in enumerate(window.spectra) if item["id"] == unconfirmed["id"])
+    assert "уровень на входе" in window.table.item(row, 13).text()
+    assert "ослабление тракта" in window.table.item(row, 11).toolTip()
+    window.views.setCurrentIndex(0)
+    assert window.archive_result_note.isVisible()
     app.processEvents()
     Path(".scratch").mkdir(exist_ok=True)
     window.grab().save(".scratch/rsa-ui-preview.png")

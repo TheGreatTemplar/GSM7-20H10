@@ -6,6 +6,7 @@ import statistics
 
 from .mixer import ip3
 from .rsa import AnalyzerConfig, frequencies, peak_near
+from .validation import FieldError
 
 
 @dataclass(frozen=True)
@@ -42,18 +43,18 @@ class TwoTonePlan:
                   self.loss1_db, self.loss2_db, self.output_loss_db, self.pad_rating_w, self.max_output_w, self.rbw_hz)
         if not all(math.isfinite(value) for value in values):
             raise ValueError("Параметры двухтонового задания должны быть конечными")
-        if self.mode not in ("pa", "mixer") or not 100000 <= self.f1_hz < self.f2_hz <= 60e6:
-            raise ValueError("Два RF-тона должны находиться в пределах 0,1…60 МГц")
+        if self.mode not in ("pa", "mixer") or not 100000 <= self.f1_hz <= 200e6 or not self.f1_hz < self.f2_hz <= 200.1e6:
+            raise FieldError("Первый RF-тон: 0,1…200 МГц; второй — выше на заданный интервал", "f1_mhz", "spacing_hz")
         if not 100 <= self.spacing_hz <= 100000:
-            raise ValueError("Интервал тонов: 100 Гц…100 кГц")
+            raise FieldError("Интервал тонов: 100 Гц…100 кГц", "spacing_hz")
         if self.spacing_hz < 10 * self.rbw_hz:
-            raise ValueError("Для разделения тонов задайте интервал не менее 10 RBW; используйте предустановку RSA для двух тонов")
+            raise FieldError("Для разделения тонов задайте интервал не менее 10 RBW; используйте предустановку RSA для двух тонов", "spacing_hz", "rbw_hz")
         if not all(-110 <= value <= 20 for value in (self.level1_dbm, self.level2_dbm, self.lo_dbm)):
             raise ValueError("Уровни источников: −110…+20 dBm с подтверждением прибором")
         if min(self.loss1_db, self.loss2_db, self.output_loss_db) < 0:
             raise ValueError("Потери трактов должны быть неотрицательны")
         if abs((self.level1_dbm - self.loss1_db) - (self.level2_dbm - self.loss2_db)) > 0.5:
-            raise ValueError("Для двухтонового IP3 выровняйте уровни на входе DUT до разности не более 0,5 дБ")
+            raise FieldError("Для двухтонового IP3 выровняйте уровни на входе DUT до разности не более 0,5 дБ", "level1", "level2", "loss1", "loss2")
         if type(self.harmonics) is not int or not 1 <= self.harmonics <= 7:
             raise ValueError("Гармоники: 1 (без гармоник) … 7")
         low, high = sorted(self.output_tones())
@@ -63,14 +64,14 @@ class TwoTonePlan:
             if not 0 < self.max_output_w <= 7:
                 raise ValueError("Для этого PA предел средней выходной мощности должен быть до 7 Вт")
             if self.pad_rating_w < self.max_output_w:
-                raise ValueError("Допустимая мощность первого аттенюатора меньше предела мощности PA")
+                raise FieldError("Допустимая мощность первого аттенюатора меньше предела мощности PA", "pad_rating", "max_w")
             predicted_pep_input = 10 * math.log10(self.max_output_w * 1000) + 3.0103 - self.output_loss_db
             if self.output_loss_db < 20 or predicted_pep_input > self.reference_dbm - 3:
-                raise ValueError("Недостаточно ослабления для заданной мощности PA и запаса RSA; используйте 20 дБ / 10 Вт + дополнительный аттенюатор")
+                raise FieldError("Недостаточно ослабления для заданной мощности PA и запаса RSA; используйте 20 дБ / 10 Вт + дополнительный аттенюатор", "output_loss", "max_w", "reference_dbm")
         for order in range(1, (self.harmonics if self.mode == "pa" else 1) + 1):
             self.analyzer_config(order).validate()
             if self.analyzer_config(order).span_hz / (self.points - 1) > self.rbw_hz / 2:
-                raise ValueError("Для выбранного интервала/гармоник увеличьте RBW или уменьшите интервал тонов")
+                raise FieldError("Для выбранного интервала/гармоник увеличьте RBW или уменьшите интервал тонов", "spacing_hz", "rbw_hz", "points")
 
     def analyzer_config(self, order=1):
         low, high = sorted(self.output_tones())

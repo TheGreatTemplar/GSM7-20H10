@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import math
 import re
 
-from .rf_instruments import socket_resource
+from .rf_instruments import connection_error_message, socket_resource
 
 
 @dataclass(frozen=True)
@@ -53,8 +53,11 @@ class Smu200a:
             self.options = self.query("*OPT?")
             if not re.search(r"SMU-B2\d\d\b", self.options):
                 raise ValueError("Не обнаружен второй RF-тракт SMU; проверьте комплектацию")
-        except Exception:
+        except Exception as error:
             self.close()
+            message = connection_error_message("SMU200A", f"{host}:{port}", error)
+            if message:
+                raise ConnectionError(message) from error
             raise
 
     def write(self, command):

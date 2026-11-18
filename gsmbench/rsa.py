@@ -3,12 +3,15 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import math
+import copy
+import statistics
 import time
 import uuid
 
 from .mixer import PathLoss, conversion_loss, isolation
-from .rf_instruments import lan_resource
+from .rf_instruments import connection_error_message, lan_resource
 from .rf_methods import ISOLATION_PORTS, target_frequency
+from .validation import FieldError
 
 
 class AcquisitionCancelled(Exception):
@@ -31,15 +34,15 @@ class AnalyzerConfig:
                    (self.center_hz, self.span_hz, self.rbw_hz, self.vbw_hz, self.reference_dbm)):
             raise ValueError("Настройки RSA должны быть конечными числами")
         if self.span_hz <= 0 or self.center_hz - self.span_hz / 2 < 0 or self.center_hz + self.span_hz / 2 > 26.5e9:
-            raise ValueError("Развёртка RSA должна находиться в пределах 0…26,5 ГГц и иметь ненулевую полосу")
+            raise FieldError("Развёртка RSA должна находиться в пределах 0…26,5 ГГц и иметь ненулевую полосу", "center_mhz", "span_mhz")
         if not 1 <= self.rbw_hz <= 1e7 or not 1 <= self.vbw_hz <= 1e7:
-            raise ValueError("RBW и VBW должны быть в пределах 1 Гц…10 МГц")
+            raise FieldError("RBW и VBW должны быть в пределах 1 Гц…10 МГц", "rbw_hz", "vbw_hz")
         if type(self.points) is not int or not 101 <= self.points <= 10001:
-            raise ValueError("Число точек RSA: 101…10001")
+            raise FieldError("Число точек RSA: 101…10001", "points")
         if type(self.attenuation_db) is not int or not 0 <= self.attenuation_db <= 50:
-            raise ValueError("Аттенюатор: 0…50 дБ")
+            raise FieldError("Аттенюатор: 0…50 дБ", "attenuation_db")
         if not -170 <= self.reference_dbm <= 30 or self.detector not in ("POS", "NORM", "RMS", "SAMP"):
-            raise ValueError("Недопустимый опорный уровень или детектор RSA")
+            raise FieldError("Недопустимый опорный уровень или детектор RSA", "reference_dbm", "detector")
 
 
 def parse_trace(text):
@@ -71,6 +74,35 @@ def peak_near(spectrum, target_hz, window_hz):
     return dict(frequency_hz=bins[index], power_dbm=spectrum["power_dbm"][index], index=index)
 
 
+def average_spectra(spectra, context):
+    if not spectra:
+        raise ValueError("Нет развёрток для усреднения")
+    if len(spectra) == 1:
+        return spectra[0]
+    first = spectra[0]
+    for spectrum in spectra:
+        if (spectrum["settings"] != first["settings"] or spectrum["identity"] != first["identity"]
+                or spectrum["demo"] != first["demo"] or len(spectrum["power_dbm"]) != len(first["power_dbm"])):
+            raise ValueError("Нельзя усреднять разные частотные сетки, приборы или настройки RSA")
+        if spectrum.get("if_overload"):
+            raise ValueError("Перегруженная развёртка не принимается в среднее")
+    result = copy.deepcopy(first)
+    result["id"] = str(uuid.uuid4())
+    result["measured_at"] = spectra[-1]["measured_at"]
+    # Average linear power, never arithmetic dBm or neighboring frequencies.
+    powers = []
+    for values in zip(*(spectrum["power_dbm"] for spectrum in spectra)):
+        reference = max(values)
+        powers.append(reference + 10 * math.log10(statistics.mean(10 ** ((value - reference) / 10) for value in values)))
+    result["power_dbm"] = powers
+    peaks = [max(spectrum["power_dbm"]) if context.get("method", "spectrum") == "spectrum" else
+        peak_near(spectrum, target_frequency(context), context["marker_window_hz"])["power_dbm"] for spectrum in spectra]
+    result["acquisition"] = "independent_sweeps_power_average"
+    result["averaging"] = dict(count=len(spectra), method="linear_power", marker_std_db=statistics.stdev(peaks),
+        marker_span_db=max(peaks) - min(peaks), marker_values_dbm=peaks, raw_sweeps=spectra)
+    return result
+
+
 def mixer_result(spectrum):
     """Persist a reproducible, explicitly preliminary result with each spectrum."""
     context = spectrum.get("context", {})
@@ -92,7 +124,12 @@ def mixer_result(spectrum):
         if spectrum.get("if_overload", False):
             raise ValueError("RSA сообщил о перегрузке ПЧ")
         if not context.get("pin_known") or not context.get("path_known"):
-            raise ValueError("Для расчёта подтвердите уровень на входном порту и поправку выходного тракта")
+            missing = []
+            if not context.get("pin_known"):
+                missing.append("уровень на входе смесителя")
+            if not context.get("path_known"):
+                missing.append("ослабление тракта до RSA")
+            raise ValueError("Не подтверждено: " + "; ".join(missing) + ". Исходный спектр сохранён.")
         metadata = spectrum["settings"]
         if metadata["amplitude_correction"] or metadata["reference_offset_db"] or metadata["external_gain_db"]:
             raise ValueError("На RSA включены амплитудные поправки: исключите двойной учёт до расчёта")
@@ -148,8 +185,11 @@ class Rsa6265:
             fields = self.identity.split(",")
             if len(fields) < 2 or fields[1].strip().upper() != "RSA6265":
                 raise ValueError("Ожидался RSA6265: " + self.identity)
-        except Exception:
+        except Exception as error:
             self.close()
+            message = connection_error_message("RSA6265", f"{host} / VXI-11", error)
+            if message:
+                raise ConnectionError(message) from error
             raise
 
     def write(self, command):
@@ -172,6 +212,7 @@ class Rsa6265:
         if len(values) != len(self.METADATA):
             raise ValueError("Неполный пакет параметров RSA")
         settings = {name: cast(value.strip()) for (name, (_, cast)), value in zip(self.METADATA.items(), values)}
+        settings["detector"] = {"RAV": "RMS", "RAVERAGE": "RMS"}.get(settings["detector"], settings["detector"])
         if settings["mode"] != "SA" or settings["unit"] != "DBM":
             raise ValueError("Для спектра нужны режим SA и единицы dBm. Примените настройки RSA.")
         numeric = [value for value in settings.values() if isinstance(value, (int, float))]

@@ -64,6 +64,15 @@ class SpectrumStore:
                 added += 1
         return added
 
+    def count(self):
+        if not self.path.exists():
+            return 0
+        with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as db:
+            self.check_tables(db)
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='rf_spectrum'").fetchone():
+                return 0
+            return db.execute("SELECT COUNT(*) FROM rf_spectrum").fetchone()[0]
+
     def load(self):
         if not self.path.exists():
             return []

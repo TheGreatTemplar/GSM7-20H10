@@ -2,7 +2,7 @@
 
 import math
 
-from .rf_instruments import socket_resource
+from .rf_instruments import connection_error_message, socket_resource
 
 
 class Ssg3000x:
@@ -24,8 +24,11 @@ class Ssg3000x:
             supported = len(fields) >= 3 and ("SSG3" in fields[1].upper() or "SSG3X" in fields[2].upper() or "АКИП-3208" in fields[1].upper())
             if not supported:
                 raise ValueError("Ожидался АКИП-3208 / SSG3000X: " + self.identity)
-        except Exception:
+        except Exception as error:
             self.close()
+            message = connection_error_message("АКИП-3208", f"{host}:{port}", error)
+            if message:
+                raise ConnectionError(message) from error
             raise
 
     def write(self, command):
