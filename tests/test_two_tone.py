@@ -4,6 +4,7 @@ import unittest
 
 from gsmbench.two_tone import TwoTonePlan, analyze_two_tone, harmonic_band
 from gsmbench.two_tone_ui import TwoToneWorker
+from gsmbench.rf_storage import add_result_uncertainty
 
 
 def spectrum(plan, order=1):
@@ -14,6 +15,13 @@ def spectrum(plan, order=1):
 
 
 class TwoToneTests(unittest.TestCase):
+    def test_stored_plan_uncertainty_derives_second_frequency_from_spacing(self):
+        trace = spectrum(TwoTonePlan())
+        self.assertNotIn("f2_hz", trace["context"]["two_tone_plan"])
+        add_result_uncertainty(trace)
+        uncertainty = trace["result"]["uncertainty"]
+        self.assertGreater(uncertainty["expanded_uncertainty_k2_db"], 0)
+
     def test_pa_fourty_db_chain_and_seven_watt_limit(self):
         TwoTonePlan().validate()
         for plan in (replace(TwoTonePlan(), output_loss_db=20), replace(TwoTonePlan(), pad_rating_w=6),

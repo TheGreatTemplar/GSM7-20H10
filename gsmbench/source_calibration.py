@@ -13,12 +13,133 @@ from PySide6 import QtCore
 
 from .nrp18t import Nrp18t, PowerReadingError
 from .rsa import AcquisitionCancelled, AnalyzerConfig, Rsa6265, peak_near
+from .rf_storage import SpectrumStore
 from .smu import Smu200a, SourcePlan, verified_off
 from .validation import FieldError
 
 
 class NrpMeasurementError(RuntimeError):
     """Only sensor reads may be skipped; source-control failures still abort."""
+
+
+def calibration_point_uncertainty(raw, plan):
+    """Estimate repeatability and manual-based RSA uncertainty for one point."""
+    if plan.method == "rsa":
+        sample_count = len(raw)
+        repeat_counts = [sample_count, sample_count]
+    else:
+        repeat_counts = [len(raw[index].get("readings_dbm", [])) for index in (0, 1)]
+        sample_count = min(repeat_counts, default=0)
+
+    if sample_count < 2:
+        channel_u = [None, None]
+        channel_sd = [None, None]
+        imbalance_u = None
+        imbalance_sd = None
+    elif plan.method == "rsa":
+        spacing = plan.f2_hz - plan.f1_hz
+        window_hz = 3 * min(100, spacing / 20)
+        peaks = [[], []]
+        for spectrum in raw:
+            for channel, frequency_hz in enumerate((plan.f1_hz, plan.f2_hz)):
+                peaks[channel].append(peak_near(spectrum, frequency_hz, window_hz)["power_dbm"])
+        channel_sd = [statistics.stdev(values) for values in peaks]
+        channel_u = [value / math.sqrt(sample_count) for value in channel_sd]
+        differences = [a - b for a, b in zip(peaks[0], peaks[1])]
+        imbalance_sd = statistics.stdev(differences)
+        imbalance_u = imbalance_sd / math.sqrt(sample_count)
+    else:
+        readings = [raw[index].get("readings_dbm", []) for index in (0, 1)]
+        channel_sd = [statistics.stdev(values) if len(values) > 1 else None for values in readings]
+        channel_u = [sd / math.sqrt(len(values)) if sd is not None else None
+            for sd, values in zip(channel_sd, readings)]
+        imbalance_sd = None
+        imbalance_u = None
+
+    analyzer = _rsa_manual_uncertainty(plan) if plan.method == "rsa" else {
+        "model": None,
+        "standard_uncertainty_db": None,
+        "status": "not_applicable",
+        "reason": "Измерения выполнены NRP18T.",
+        "combined_standard_uncertainty_db": None,
+        "expanded_uncertainty_k2_db": None,
+    }
+    if plan.method == "rsa":
+        for index, component in enumerate(analyzer["channels"]):
+            u_a = channel_u[index]
+            u_b = component["standard_uncertainty_db"]
+            component["type_a_standard_uncertainty_db"] = u_a
+            component["combined_standard_uncertainty_db"] = math.sqrt(u_a ** 2 + u_b ** 2) if u_a is not None else None
+            component["expanded_combined_uncertainty_k2_db"] = 2 * component["combined_standard_uncertainty_db"] if component["combined_standard_uncertainty_db"] is not None else None
+    else:
+        analyzer["status"] = "type_a_only"
+        analyzer["reason"] = "Для NRP18T здесь рассчитана только повторяемость; Type B из документации прибора не добавлена."
+        analyzer["channels"] = []
+        for u_a in channel_u:
+            analyzer["channels"].append({
+                "standard_uncertainty_db": None,
+                "combined_standard_uncertainty_db": u_a,
+                "expanded_combined_uncertainty_k2_db": 2 * u_a if u_a is not None else None,
+                "basis": "type_a_repeatability_only",
+            })
+
+    return {
+        "basis": "type_a_repeatability_plus_manual_based_rsa_type_b_estimate" if plan.method == "rsa" else "type_a_repeatability",
+        "repeat_count_by_channel": repeat_counts,
+        "channels": [
+            {
+                "standard_deviation_db": channel_sd[index],
+                "standard_uncertainty_db": channel_u[index],
+                "expanded_uncertainty_k2_db": 2 * channel_u[index] if channel_u[index] is not None else None,
+            }
+            for index in (0, 1)
+        ],
+        "imbalance_a_minus_b": {
+            "standard_deviation_db": imbalance_sd,
+            "standard_uncertainty_db": imbalance_u,
+            "expanded_uncertainty_k2_db": 2 * imbalance_u if imbalance_u is not None else None,
+        },
+        "analyzer": analyzer,
+    }
+
+
+def _rsa_manual_uncertainty(plan):
+    """Use a conservative estimate from the RSA6000 manual/datasheet limits.
+
+    Above 10 MHz, combine the 0.8 dB nominal expanded level uncertainty
+    (95%, k≈2) with the rectangular 0.3 dB attenuation-switching limit.
+    At/below 10 MHz, combine rectangular manual limits for absolute amplitude
+    accuracy, frequency response, and attenuation switching (0.3, 0.5, 0.3 dB).
+    The actual acquisition settings differ, so this is an engineering estimate,
+    not a traceable uncertainty claim.
+    """
+    frequency_hz = (plan.f1_hz, plan.f2_hz)
+    channels = []
+    for frequency in frequency_hz:
+        if frequency > 10e6:
+            basis = "level_uncertainty_0.8db_95pct_plus_rectangular_attenuation_switching_0.3db"
+            standard = math.sqrt((0.8 / 2) ** 2 + (0.3 / math.sqrt(3)) ** 2)
+        else:
+            basis = "rectangular_absolute_amplitude_0.3db_frequency_response_0.5db_attenuation_switching_0.3db"
+            standard = math.sqrt((0.3 ** 2 + 0.5 ** 2 + 0.3 ** 2) / 3)
+        channels.append({
+            "frequency_hz": frequency,
+            "standard_uncertainty_db": standard,
+            "expanded_uncertainty_k2_db": 2 * standard,
+            "basis": basis,
+        })
+    return {
+        "model": "RIGOL RSA6265",
+        "source": "RIGOL RSA6000 Data Sheet, pp. 9-11 (specification limits used as manual-derived estimates)",
+        "status": "manual_based_estimate_settings_differ",
+        "distribution": "mixed: published 95% uncertainty and rectangular specification limits",
+        "standard_uncertainty_db": None,
+        "error_envelope_db": None,
+        "reason": "Серия измерена при RBW/VBW 100 Гц, аттенюаторе 20 дБ и RMS-детекторе. Для частот >10 МГц объединены паспортные 0,8 дБ при 95% (в РЭ указаны RBW/VBW 1 кГц и ослабление 10 дБ) и прямоугольная составляющая переключения аттенюатора 0,3 дБ. При частотах ≤10 МГц объединены прямоугольные пределы: абсолютная точность 0,3 дБ, АЧХ 0,5 дБ и переключение аттенюатора 0,3 дБ. Оценка не подтверждена для фактических настроек серии.",
+        "channels": channels,
+        "combined_standard_uncertainty_db": None,
+        "expanded_uncertainty_k2_db": None,
+    }
 
 
 @dataclass(frozen=True)
@@ -93,6 +214,19 @@ class CalibrationPlan:
 
 def calibrated_source_plan(profile, plan, settings):
     """Exact measured grid only; never extrapolate or silently reuse another path."""
+    if (profile.get("plan", {}).get("method") != "nrp"
+            and not all(math.isclose(a, b, abs_tol=0.05, rel_tol=0) for a, b in
+                ((profile.get("plan", {}).get("f1_hz", math.nan), plan.f1_hz),
+                 (profile.get("plan", {}).get("f2_hz", math.nan), plan.f2_hz)))):
+        batch = profile.get("calibration_batch_id", profile["id"])
+        candidate = next((item for item in settings.get("power_calibration_profiles", [])
+            if item.get("calibration_batch_id", item["id"]) == batch
+            and item.get("plan", {}).get("method") == profile.get("plan", {}).get("method")
+            and all(math.isclose(a, b, abs_tol=0.05, rel_tol=0) for a, b in
+                ((item.get("plan", {}).get("f1_hz", math.nan), plan.f1_hz),
+                 (item.get("plan", {}).get("f2_hz", math.nan), plan.f2_hz)))), None)
+        if candidate is not None:
+            profile = candidate
     if (profile.get("schema") != 1 or profile.get("state") not in ("complete", "complete_with_gaps") or not profile.get("rf_off_confirmed")
             or profile.get("demo") != settings["demo"] or not profile.get("points")):
         raise FieldError("Нужен завершённый профиль калибровки в текущем режиме, с подтверждённым RF OFF", "profiles")
@@ -238,6 +372,14 @@ class PowerCalibrationWorker(QtCore.QThread):
         profile.update(calibration_batch_id=settings.get("calibration_batch_id", profile["id"]),
             frequency_sweep=settings.get("frequency_sweep", dict(first_hz=plan.f1_hz, last_hz=plan.f1_hz,
                 step_hz=plan.frequency_step_hz, count=1)))
+        profile["uncertainty_model"] = {
+            "repeatability": "Type A from repeated readings; uA=s/sqrt(n); expanded UA=2*uA (k=2).",
+            "analyzer_model": "RIGOL RSA6265" if plan.method == "rsa" else None,
+            "analyzer_error": "Manual-based, frequency-dependent Type B estimate combined per tone. Actual RBW/VBW, attenuation, and detector settings differ from published conditions." if plan.method == "rsa" else "NRP18T Type B uncertainty is not specified by this model.",
+            "analyzer_source": "RIGOL RSA6000 Data Sheet, pp. 9-11",
+            "combined_uncertainty": "u_c=sqrt(u_A^2+u_B^2); U_c=2*u_c (k=2).",
+            "expanded_combined_uncertainty_k2": "Stored per channel and point.",
+        }
         try:
             levels = plan.levels()
             unavailable = {}
@@ -326,7 +468,8 @@ class PowerCalibrationWorker(QtCore.QThread):
                     if max(map(abs, errors)) <= plan.tolerance_db and abs(measured[0] - measured[1]) <= plan.tolerance_db:
                         profile["points"].append(dict(target_dbm=target, measured_dbm=measured,
                             commands_dbm=[source.rf_dbm, source.lo_dbm], correction_db=corrections,
-                            imbalance_db=measured[0] - measured[1], iterations=iteration + 1))
+                            imbalance_db=measured[0] - measured[1], iterations=iteration + 1,
+                            uncertainty=calibration_point_uncertainty(raw, plan)))
                         self.save(profile)
                         self.profile_ready.emit(json.loads(json.dumps(profile)))
                         break
@@ -477,6 +620,8 @@ class PowerCalibrationWorker(QtCore.QThread):
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(profile, ensure_ascii=False, allow_nan=False), encoding="utf-8")
         temporary.replace(target)
+        if self.settings.get("database"):
+            SpectrumStore(self.settings["database"], profile["demo"]).save_calibration(profile)
 
 
 def load_profiles(root, demo, include_incomplete=False):

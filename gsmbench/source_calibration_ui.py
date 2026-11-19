@@ -7,10 +7,12 @@ import pyqtgraph as pg
 from shiboken6 import isValid
 
 from .source_calibration import CalibrationPlan, load_profiles
+from .rf_storage import SpectrumStore
 from .form_layout import compact_inputs, GroupedFormRows
 from .validation import FieldError, FieldFeedback, StatusLabel
 from .rf_labels import INPUT_ATTENUATION_A, INPUT_ATTENUATION_B, INPUT_ATTENUATION_HINT, AFTER_COMBINER_ATTENUATION
 from .plot_hover import PointHover
+from .table_filters import configure_table
 
 
 class PowerCalibrationPanel(QtWidgets.QWidget):
@@ -182,8 +184,11 @@ class PowerCalibrationPanel(QtWidgets.QWidget):
         plot_tools_layout.addWidget(self.reset_scale_button)
         results.setCornerWidget(plot_tools, QtCore.Qt.Corner.TopRightCorner)
         results.addTab(self.plot, "Поправки каналов")
-        self.table = QtWidgets.QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(["Частота,\nМГц", "Цель,\ndBm", "SMU A,\ndBm", "SMU B,\ndBm", "Изм. A,\ndBm", "Изм. B,\ndBm", "A−B, дБ", "Результат"])
+        self.table = QtWidgets.QTableWidget(0, 11)
+        configure_table(self.table)
+        self.table.setHorizontalHeaderLabels(["Частота,\nМГц", "Цель,\ndBm", "SMU A,\ndBm", "SMU B,\ndBm",
+            "Изм. A,\ndBm", "Изм. B,\ndBm", "A−B, дБ", "U A/1,\ndB k=2", "U B/2,\ndB k=2",
+            "U A−B,\ndB k=2", "Результат"])
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
@@ -360,6 +365,18 @@ class PowerCalibrationPanel(QtWidgets.QWidget):
     def reload(self):
         selected = self.profiles.currentData()
         self.archived = load_profiles(self.owner.bench.root, self.owner.bench.demo.isChecked(), include_incomplete=True)
+        try:
+            database = SpectrumStore(self.owner.bench.store().path, self.owner.bench.demo.isChecked())
+            database_profiles = database.load_calibrations()
+            known = {item["id"] for item in database_profiles}
+            for profile in self.archived:
+                if profile["id"] not in known:
+                    database.save_calibration(profile)
+                    database_profiles.append(profile)
+            known = {item["id"] for item in self.archived}
+            self.archived.extend(item for item in database_profiles if item["id"] not in known)
+        except Exception as error:
+            self.owner.bench.log.appendPlainText("Не удалось добавить профили калибровки в БД смесителей: " + str(error))
         self.available = [item for item in self.archived if item.get("state") in ("complete", "complete_with_gaps")
             and item.get("rf_off_confirmed") and item.get("points")]
         blocker = QtCore.QSignalBlocker(self.profiles)
@@ -469,7 +486,12 @@ class PowerCalibrationPanel(QtWidgets.QWidget):
             if not failed and state in ("cancelled", "failed"):
                 outcome = "Измерено*"
             values = [point["target_dbm"], *point["commands_dbm"], *point.get("measured_dbm", [None, None]), point.get("imbalance_db")]
-            texts = [frequency] + [f"{value:+.3f}" if value is not None else "—" for value in values] + [outcome]
+            channels = point.get("uncertainty", {}).get("channels", [])
+            uncertainty_values = [channels[index].get("expanded_combined_uncertainty_k2_db")
+                if index < len(channels) else None for index in (0, 1)]
+            uncertainty_values.append(point.get("uncertainty", {}).get("imbalance_a_minus_b", {}).get("expanded_uncertainty_k2_db"))
+            texts = ([frequency] + [f"{value:+.3f}" if value is not None else "—" for value in values]
+                + [f"{value:.3f}" if value is not None else "—" for value in uncertainty_values] + [outcome])
             signature = (tuple(texts), point.get("error"), state in ("cancelled", "failed"), self.failure_kind(point) if failed else None)
             signatures.append(signature)
             if row < len(self.table_signatures) and self.table_signatures[row] == signature:
@@ -478,6 +500,25 @@ class PowerCalibrationPanel(QtWidgets.QWidget):
                 item = QtWidgets.QTableWidgetItem(value)
                 if state in ("cancelled", "failed"):
                     item.setToolTip("Частотный профиль не завершён. Точка доступна для просмотра, но профиль не применяется к генератору.")
+                if not failed and column in (4, 5):
+                    channel = column - 4
+                    uncertainty = point.get("uncertainty", {})
+                    components = uncertainty.get("channels", [])
+                    if channel < len(components):
+                        component = components[channel]
+                        if component.get("standard_uncertainty_db") is not None:
+                            analyzer = uncertainty.get("analyzer", {})
+                            analyzer_channels = analyzer.get("channels", [])
+                            analyzer_u = analyzer_channels[channel].get("standard_uncertainty_db") if channel < len(analyzer_channels) else None
+                            combined_u = component.get("expanded_combined_uncertainty_k2_db")
+                            analyzer_u_text = f"{analyzer_u:.4f} дБ" if analyzer_u is not None else "не указана"
+                            combined_u_text = f"{combined_u:.4f} дБ" if combined_u is not None else "не рассчитана"
+                            item.setToolTip(
+                                f"Стандартная неопределённость повторяемости uA: {component['standard_uncertainty_db']:.4f} дБ\n"
+                                f"Расширенная повторяемость UА (k=2): {component['expanded_uncertainty_k2_db']:.4f} дБ\n"
+                                f"Неопределённость RSA (по РЭ): {analyzer_u_text}\n"
+                                f"Комбинированная расширенная U (k=2): {combined_u_text}\n"
+                                "Оценка по паспортным пределам; фактические настройки RSA отличаются.")
                 if failed:
                     item.setBackground(QtGui.QColor("#665027" if self.failure_kind(point) == "source_limit" else "#612c34"))
                     item.setForeground(QtGui.QColor("#ffffff"))
@@ -506,7 +547,8 @@ class PowerCalibrationPanel(QtWidgets.QWidget):
                     x, y = [value[0] for value in signature], [value[1] for value in signature]
                     data = [dict(frequency_hz=hz, channel=channel, index=index + 1, count=len(points),
                         power_dbm=point["target_dbm"], correction_db=point["correction_db"][channel],
-                        command_dbm=point["commands_dbm"][channel], measured_dbm=point["measured_dbm"][channel])
+                        command_dbm=point["commands_dbm"][channel], measured_dbm=point["measured_dbm"][channel],
+                        uncertainty=point.get("uncertainty"))
                         for index, point in enumerate(points)]
                     self.plot_curves[key].setData(x, y, data=data)
                     self.point_hover.attach(self.plot_curves[key], x, y, data)
@@ -515,11 +557,28 @@ class PowerCalibrationPanel(QtWidgets.QWidget):
     @staticmethod
     def point_hint_text(point):
         frequency = f"{point['frequency_hz'] / 1e6:.6f}".rstrip("0").rstrip(".")
-        return (f"{frequency} МГц · канал {('A/1', 'B/2')[point['channel']]} · точка {point['index']}/{point['count']}\n"
+        text = (f"{frequency} МГц · канал {('A/1', 'B/2')[point['channel']]} · точка {point['index']}/{point['count']}\n"
             f"На выходе комбинера: {point['power_dbm']:+.3f} dBm\n"
             f"Поправка: {point['correction_db']:+.3f} дБ\n"
             f"Задано SMU: {point['command_dbm']:+.3f} dBm\n"
             f"Измерено: {point['measured_dbm']:+.3f} dBm")
+        uncertainty = point.get("uncertainty", {})
+        channels = uncertainty.get("channels", [])
+        channel = point["channel"]
+        if channel < len(channels) and channels[channel].get("standard_uncertainty_db") is not None:
+            component = channels[channel]
+            analyzer = uncertainty.get("analyzer", {}).get("channels", [])
+            analyzer_component = analyzer[channel] if channel < len(analyzer) else {}
+            analyzer_u = analyzer_component.get("standard_uncertainty_db")
+            combined_u = component.get("expanded_combined_uncertainty_k2_db")
+            analyzer_u_text = f"{analyzer_u:.4f} дБ" if analyzer_u is not None else "не указана"
+            combined_u_text = f"{combined_u:.4f} дБ" if combined_u is not None else "не рассчитана"
+            text += (f"\nuA повторяемости: {component['standard_uncertainty_db']:.4f} дБ"
+                f"\nUА (k=2): {component['expanded_uncertainty_k2_db']:.4f} дБ"
+                f"\nuB RSA по РЭ: {analyzer_u_text}"
+                f"\nUкомб (k=2): {combined_u_text}"
+                "\nОценка по РЭ; условия измерения отличаются от паспортных")
+        return text
 
     def set_busy(self, busy):
         for widget in self.fields.values():

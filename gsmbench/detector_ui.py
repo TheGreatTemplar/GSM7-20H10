@@ -22,7 +22,7 @@ from .form_layout import compact_inputs
 from .validation import FieldError, FieldFeedback, StatusLabel
 from .rf_labels import SETTLING_TIME
 from .rsa import AcquisitionCancelled
-from .table_filters import FilterHeader
+from .table_filters import FilterHeader, configure_table
 
 
 class DetectorWorker(QtCore.QThread):
@@ -387,6 +387,7 @@ class DetectorPanel(QtWidgets.QWidget):
         splitter.addWidget(tabs)
         splitter.setSizes([420, 280])
         self.points = QtWidgets.QTableWidget(0, 6)
+        configure_table(self.points)
         self.points.setHorizontalHeaderLabels(["№", "Задано, dBm", "На детекторе, dBm", "U, В", "σ, В", "Отсчётов"])
         self.points.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.points.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -400,6 +401,7 @@ class DetectorPanel(QtWidgets.QWidget):
         self.archive_headers = ["Детектор", "Дата UTC", "Источник", "LO, МГц", "Точек", "Статус", "Примечание"]
         self.archive = QtWidgets.QTableWidget(0, len(self.archive_headers))
         self.archive.setHorizontalHeader(FilterHeader(self.archive))
+        configure_table(self.archive)
         self.archive.setHorizontalHeaderLabels(self.archive_headers)
         self.archive.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.archive.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)

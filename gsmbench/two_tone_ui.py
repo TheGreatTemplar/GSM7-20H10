@@ -14,10 +14,11 @@ import pyqtgraph as pg
 import pyqtgraph.exporters
 
 from .rf_storage import SpectrumStore
+from .uncertainty import result_uncertainty
 from .rsa import AcquisitionCancelled, Rsa6265, demo_spectrum, frequencies
 from .smu import Smu200a, SourcePlan, verified_off
 from .ssg import Ssg3000x, verified_ssg_off
-from .two_tone import TwoTonePlan, analyze_two_tone, harmonic_band
+from .two_tone import TwoTonePlan, analyze_two_tone, harmonic_band, parse_frequency_ranges, parse_level_ranges
 from .source_calibration import PowerCalibrationWorker, calibrated_source_plan
 from .source_calibration_ui import PowerCalibrationPanel
 from .form_layout import compact_inputs
@@ -118,6 +119,7 @@ class TwoToneWorker(QtCore.QThread):
                 if self.settings.get("power_calibration"):
                     profile = self.settings["power_calibration"]
                     context["source_calibration"] = dict(id=profile["id"], method=profile["plan"]["method"],
+                        f1_hz=profile["plan"]["f1_hz"], f2_hz=profile["plan"]["f2_hz"],
                         path=profile["path"], created_at=profile["created_at"], meter_identity=profile["meter_identity"],
                         commands=asdict(self.source_plan(plan)), tolerance_db=profile["plan"]["tolerance_db"],
                         points=[point for point in profile["points"] if any(math.isclose(point["target_dbm"], target,
@@ -135,6 +137,7 @@ class TwoToneWorker(QtCore.QThread):
                 result = analyze_two_tone(spectrum)
                 spectrum["result"] = result
                 self.save(store, spectrum)
+                result = spectrum["result"]
                 if result["status"] != "preliminary":
                     raise ValueError(result["reason"])
                 point = dict(spectrum_id=spectrum["id"], plan=asdict(plan), result=result, harmonics=[], demo=self.settings["demo"])
@@ -150,7 +153,10 @@ class TwoToneWorker(QtCore.QThread):
                         if smu and (smu.state() != generator or akip.state() != generator2):
                             raise ValueError("Источники изменились во время измерения гармоник")
                         band = harmonic_band(harmonic, plan, order)
-                        fundamental = max(result["fundamental_low_dbm"], result["fundamental_high_dbm"])
+                        fundamental_name = "fund_low" if result["fundamental_low_dbm"] >= result["fundamental_high_dbm"] else "fund_high"
+                        fundamental = result["fundamental_low_dbm"] if fundamental_name == "fund_low" else result["fundamental_high_dbm"]
+                        band["fundamental_dbm"] = fundamental
+                        band["fundamental_frequency_hz"] = result["markers"][fundamental_name]["frequency_hz"]
                         band["dbc"] = band["output_dbm"] - fundamental if band["resolved"] else None
                         band["noise_limit_dbc"] = band["noise_dbm"] + 10 + plan.output_loss_db - fundamental
                         point["harmonics"].append(band)
@@ -319,6 +325,18 @@ class TwoTonePanel(QtWidgets.QWidget):
         lo = add("lo_mhz", "LO для смесителя, МГц", 25.0592, 0.1, 3070, 6, place=False)
         lo_level = add("lo_dbm", "АКИП · уровень LO, dBm", 13, -110, 20, place=False)
         self.lo_group = paired_row("LO смесителя · АКИП", "Частота, МГц", lo, "Уровень, dBm", lo_level)
+        frequency_ranges = QtWidgets.QLineEdit()
+        frequency_ranges.setPlaceholderText("например: 1.810..2.000/0.095; 50..52/1")
+        frequency_ranges.setToolTip("Диапазоны через точку с запятой; формат начало..конец/шаг, МГц. Можно указать одну частоту. "
+            "При серии для смесителя LO автоматически задаётся выше RF на выбранную ПЧ.")
+        add("frequency_ranges", "RF диапазоны и шаг, МГц", frequency_ranges)
+        add("if_mhz", "ПЧ для частотной серии, МГц", 11.0592, 0.1, 3000, 6)
+        self.fields["if_mhz"].setToolTip("Для каждой частоты серии задаётся LO = RF + ПЧ. Одиночное измерение использует частоту LO выше.")
+        lo_levels = QtWidgets.QLineEdit()
+        lo_levels.setPlaceholderText("например: 10..20/1")
+        lo_levels.setToolTip("Необязательная серия уровня LO. Формат диапазон начало..конец/шаг или список через ';'. "
+            "Число точек умножается на частоты и уровни RF.")
+        add("lo_levels", "Уровни LO, dBm", lo_levels)
         first.valueChanged.connect(self.update_second_tone)
         self.fields["spacing_hz"].valueChanged.connect(self.update_second_tone)
         self.update_second_tone()
@@ -336,7 +354,9 @@ class TwoTonePanel(QtWidgets.QWidget):
         add("drive_stop", "Последний уровень тона 1, dBm", -10, -110, 20)
         add("drive_step", "Шаг уровней, дБ", 1, 0.1, 1)
         for widget in self.fields.values():
-            signal = widget.currentIndexChanged if isinstance(widget, QtWidgets.QComboBox) else widget.toggled if isinstance(widget, QtWidgets.QCheckBox) else widget.valueChanged
+            signal = (widget.currentIndexChanged if isinstance(widget, QtWidgets.QComboBox) else
+                widget.toggled if isinstance(widget, QtWidgets.QCheckBox) else
+                widget.textChanged if isinstance(widget, QtWidgets.QLineEdit) else widget.valueChanged)
             signal.connect(lambda *args: self.settings_changed.emit())
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.wiring = QtWidgets.QLabel()
@@ -384,8 +404,10 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.feedback = FieldFeedback(dict(self.bench.fields, **self.fields))
         self.pages.addTab(self.calibration, "Калибровка уровней SMU")
         self.calibration.changed.connect(lambda: self.settings_changed.emit())
-        for key in ("f1_mhz", "spacing_hz", "loss1", "loss2"):
-            self.fields[key].valueChanged.connect(lambda: self.calibration.confirm.setChecked(False))
+        for key in ("f1_mhz", "spacing_hz", "loss1", "loss2", "frequency_ranges", "if_mhz"):
+            widget = self.fields[key]
+            signal = widget.textChanged if isinstance(widget, QtWidgets.QLineEdit) else widget.valueChanged
+            signal.connect(lambda: self.calibration.confirm.setChecked(False))
         self.bench.demo.toggled.connect(self.calibration.reload)
         self.calibration.reload()
         self.mode_changed()
@@ -394,7 +416,8 @@ class TwoTonePanel(QtWidgets.QWidget):
     def settings(self):
         return dict(source_layout="smu_ab_akip_lo", power_calibration=self.calibration.settings(),
             **{key: widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else
-                widget.isChecked() if isinstance(widget, QtWidgets.QCheckBox) else widget.value()
+                widget.isChecked() if isinstance(widget, QtWidgets.QCheckBox) else
+                widget.text().strip() if isinstance(widget, QtWidgets.QLineEdit) else widget.value()
                 for key, widget in self.fields.items() if key != "wiring"})
 
     def update_second_tone(self):
@@ -411,6 +434,8 @@ class TwoTonePanel(QtWidgets.QWidget):
                 widget.setCurrentIndex(max(0, widget.findData(value)))
             elif isinstance(widget, QtWidgets.QCheckBox):
                 widget.setChecked(bool(value))
+            elif isinstance(widget, QtWidgets.QLineEdit):
+                widget.setText(str(value))
             else:
                 widget.setValue(value)
             del blocker
@@ -428,6 +453,10 @@ class TwoTonePanel(QtWidgets.QWidget):
         for key in ("pad_rating", "max_w", "harmonics"):
             self.fields[key].setEnabled(pa)
             self.form.setRowVisible(self.fields[key], pa)
+        self.fields["if_mhz"].setEnabled(not pa)
+        self.form.setRowVisible(self.fields["if_mhz"], not pa)
+        self.fields["lo_levels"].setEnabled(not pa)
+        self.form.setRowVisible(self.fields["lo_levels"], not pa)
         if reset:
             self.fields["output_loss"].setValue(40 if pa else 0)
         self.fields["wiring"].setChecked(False)
@@ -454,16 +483,28 @@ class TwoTonePanel(QtWidgets.QWidget):
             rbw_hz=self.bench.rbw_hz.currentData(), attenuation_db=self.bench.attenuation_db.value(),
             reference_dbm=self.bench.reference_dbm.value(), points=self.bench.points.value(),
             harmonics=int(data["harmonics"]) if data["mode"] == "pa" else 1, calibrated=data["calibrated"])
-        count = 1
+        frequencies_hz = parse_frequency_ranges(data.get("frequency_ranges", "")) or [plan.f1_hz]
+        lo_levels = ([data["lo_dbm"]] if data["mode"] == "pa" else
+            parse_level_ranges(data.get("lo_levels", ""), data["lo_dbm"]))
+        levels = [data["level1"]]
         if data["sweep"]:
             if data["drive_stop"] <= data["level1"]:
                 raise ValueError("Последний уровень должен быть выше первого")
-            count = math.ceil((data["drive_stop"] - data["level1"]) / data["drive_step"]) + 1
-        if count > 201:
-            raise ValueError("В серии допускается до 201 двухтоновой точки")
-        result = [replace(plan, level1_dbm=min(data["drive_stop"], data["level1"] + index * data["drive_step"]) if count > 1 else data["level1"],
-            level2_dbm=data["level2"] + (min(data["drive_stop"], data["level1"] + index * data["drive_step"]) - data["level1"]) if count > 1 else data["level2"])
-            for index in range(count)]
+            level_count = math.ceil((data["drive_stop"] - data["level1"]) / data["drive_step"]) + 1
+            levels = [min(data["drive_stop"], data["level1"] + index * data["drive_step"])
+                for index in range(level_count)]
+        if len(frequencies_hz) * len(levels) * len(lo_levels) > 201:
+            raise ValueError("В серии допускается до 201 комбинации частоты, RF- и LO-уровней")
+        frequency_series = bool(data.get("frequency_ranges", "").strip())
+        result = []
+        for frequency_hz in frequencies_hz:
+            lo_hz = (frequency_hz + data["if_mhz"] * 1e6
+                if frequency_series and data["mode"] == "mixer" else plan.lo_hz)
+            for lo_dbm in lo_levels:
+                for level1_dbm in levels:
+                    level2_dbm = data["level2"] + level1_dbm - data["level1"] if data["sweep"] else data["level2"]
+                    result.append(replace(plan, f1_hz=frequency_hz, lo_hz=lo_hz, lo_dbm=lo_dbm,
+                        level1_dbm=level1_dbm, level2_dbm=level2_dbm))
         for item in result:
             item.validate()
         return result
@@ -558,9 +599,21 @@ class TwoTonePanel(QtWidgets.QWidget):
     def received(self, point):
         self.points.append(point)
         result = point["result"]
-        self.summary.setText(f"Точек: {len(self.points)} · Pср по основным тонам {result['output_average_w']:.4g} Вт · "
+        frequency_count = len({item["plan"]["f1_hz"] for item in self.points})
+        lo_count = len({item["plan"]["lo_dbm"] for item in self.points})
+        uncertainty = result.get("uncertainty", {})
+        uncertainty_text = (f"U результата {uncertainty['expanded_uncertainty_k2_db']:.3f} дБ (k=2)."
+            if uncertainty.get("expanded_uncertainty_k2_db") is not None else "U результата не рассчитана.")
+        power_u = uncertainty.get("output_power") or {}
+        power_text = (f" Pср U={power_u['average_power_expanded_db_k2']:.3f} дБ, "
+            f"PEP U={power_u['pep_expanded_db_k2']:.3f} дБ (k=2)."
+            if "average_power_expanded_db_k2" in power_u and "pep_expanded_db_k2" in power_u else "")
+        self.summary.setText(f"Точек: {len(self.points)} · частот: {frequency_count} · "
+            f"уровней LO: {lo_count} · "
+            f"Pср по основным тонам {result['output_average_w']:.4g} Вт · "
             f"PEP по основным тонам {result['output_pep_w']:.4g} Вт. "
-            + ("Поправки подтверждены." if result["calibrated"] else "Использованы номинальные поправки; IP3 не рассчитывается."))
+            + ("Поправки подтверждены. " if result["calibrated"] else "Использованы номинальные поправки; IP3 не рассчитывается. ")
+            + uncertainty_text + power_text)
         self.plot_power()
 
     def stop(self):
@@ -610,28 +663,58 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.plot.clear()
         if not self.points:
             return
-        x = [point["plan"]["level1_dbm"] - point["plan"]["loss1_db"] for point in self.points]
-        for key, title, color in (("output_average_w", "Средняя мощность двух тонов", "#45d7d0"),
-                                  ("output_pep_w", "PEP двух тонов", "#f4bd61")):
-            self.plot.plot(x, [point["result"][key] for point in self.points], pen=pg.mkPen(color, width=2),
-                           symbol="o", symbolSize=6, name=title)
+        self._show_legend()
+        groups = {}
+        for point in self.points:
+            plan = point["plan"]
+            groups.setdefault((plan["f1_hz"], plan["lo_dbm"]), []).append(point)
+        for index, ((frequency, lo_dbm), points) in enumerate(sorted(groups.items())):
+            points.sort(key=lambda point: point["plan"]["level1_dbm"])
+            x = [point["plan"]["level1_dbm"] - point["plan"]["loss1_db"] for point in points]
+            color = pg.intColor(index, hues=max(1, len(groups)))
+            label_prefix = f"{frequency / 1e6:g} МГц · LO {lo_dbm:g} dBm"
+            self.plot.plot(x, [point["result"]["output_average_w"] for point in points],
+                pen=pg.mkPen(color, width=2), symbol="o", symbolSize=6,
+                name=label_prefix + " · Pср")
+            self.plot.plot(x, [point["result"]["output_pep_w"] for point in points],
+                pen=pg.mkPen(color, width=1, style=QtCore.Qt.PenStyle.DashLine), symbol="t", symbolSize=6,
+                name=label_prefix + " · PEP")
         self.axes("Pin одного тона с поправкой, dBm", "Мощность, Вт")
 
     def plot_distortion(self):
         self.plot.clear()
         if not self.points:
             return
-        x = [point["result"]["output_average_w"] for point in self.points]
-        for side, color in (("low", "#45d7d0"), ("high", "#f4bd61")):
-            y = [point["result"]["sides"][side]["im3_dbc"] for point in self.points]
-            self.plot.plot(x, [float("nan") if value is None else value for value in y], connect="finite",
-                pen=pg.mkPen(color, width=2), symbol="o", name="IM3 " + side)
-        for order in range(2, 8):
-            y = [next((band["dbc"] for band in point["harmonics"] if band["order"] == order), float("nan")) for point in self.points]
-            y = [float("nan") if value is None else value for value in y]
-            if any(math.isfinite(value) for value in y):
-                self.plot.plot(x, y, connect="finite", pen=pg.mkPen(pg.intColor(order, hues=8), width=2), symbol="o", name=f"Пик полосы H{order}")
+        self._show_legend()
+        groups = {}
+        for point in self.points:
+            plan = point["plan"]
+            groups.setdefault((plan["f1_hz"], plan["lo_dbm"]), []).append(point)
+        for index, ((frequency, lo_dbm), points) in enumerate(sorted(groups.items())):
+            points.sort(key=lambda point: point["plan"]["level1_dbm"])
+            x = [point["result"]["output_average_w"] for point in points]
+            color = pg.intColor(index, hues=max(1, len(groups)))
+            label_prefix = f"{frequency / 1e6:g} МГц · LO {lo_dbm:g} dBm"
+            for side, style in (("low", QtCore.Qt.PenStyle.SolidLine), ("high", QtCore.Qt.PenStyle.DashLine)):
+                y = [point["result"]["sides"][side]["im3_dbc"] for point in points]
+                self.plot.plot(x, [float("nan") if value is None else value for value in y], connect="finite",
+                    pen=pg.mkPen(color, width=2, style=style), symbol="o",
+                    name=label_prefix + f" · IM3 {side}")
+            for order in range(2, 8):
+                y = [next((band["dbc"] for band in point["harmonics"] if band["order"] == order), float("nan")) for point in points]
+                y = [float("nan") if value is None else value for value in y]
+                if any(math.isfinite(value) for value in y):
+                    self.plot.plot(x, y, connect="finite", pen=pg.mkPen(color, width=1,
+                        style=QtCore.Qt.PenStyle.DotLine), symbol="o", name=label_prefix + f" · H{order}")
         self.axes("Средняя мощность двух основных тонов, Вт", "Уровень относительно одного тона, dBc")
+
+    def _show_legend(self):
+        legend = self.plot.plotItem.legend
+        if legend is None:
+            legend = self.plot.addLegend()
+        else:
+            legend.clear()
+            legend.show()
 
     def axes(self, bottom, left):
         for name, label in (("bottom", bottom), ("left", left)):
@@ -656,9 +739,12 @@ class TwoTonePanel(QtWidgets.QWidget):
             result = analyze_two_tone(item)
             if result["status"] != "preliminary":
                 continue
+            result["uncertainty"] = item.get("result", {}).get("uncertainty") or result_uncertainty(item, result)
             plan = item["context"]["two_tone_plan"]
-            fixed = {key: value for key, value in plan.items() if key not in ("level1_dbm", "level2_dbm")}
+            fixed = {key: value for key, value in plan.items()
+                if key not in ("level1_dbm", "level2_dbm", "f1_hz", "lo_hz", "lo_dbm")}
             fixed["level_difference"] = plan["level2_dbm"] - plan["level1_dbm"]
+            fixed["if_offset_hz"] = plan["lo_hz"] - plan["f1_hz"]
             fixed["demo"] = item["demo"]
             fixed["sample"] = item["context"].get("sample")
             fixed["series_id"] = item["context"].get("series_id")
@@ -670,9 +756,11 @@ class TwoTonePanel(QtWidgets.QWidget):
         if len(signatures) > 1:
             self.status.setText("Выберите одну серию архивным фильтром: частоты, тракты или серии различаются.")
             return
-        self.points = sorted(points, key=lambda point: point["plan"]["level1_dbm"])
+        self.points = sorted(points, key=lambda point: (point["plan"]["f1_hz"], point["plan"]["lo_dbm"],
+            point["plan"]["level1_dbm"]))
         self.plot_distortion()
-        self.summary.setText(f"Из архива: {len(self.points)} двухтоновых точек. Связанные гармонические полосы добавлены по UUID.")
+        self.summary.setText(f"Из архива: {len(self.points)} двухтоновых точек, "
+            f"частот {len({point['plan']['f1_hz'] for point in self.points})}. Связанные гармонические полосы добавлены по UUID.")
         self.status.setText("Архивные данные; приборы не включались. Вердикт не задаётся.")
 
     def export_png(self):
@@ -697,11 +785,15 @@ class TwoTonePanel(QtWidgets.QWidget):
             try:
                 with open(path, "w", encoding="utf-8-sig", newline="") as stream:
                     writer = csv.writer(stream, delimiter=";")
-                    writer.writerow(["UUID", "Pin1_dBm", "Pavg_W", "PEP_W", "IM3_low_dBc", "IM3_high_dBc", "Гармонические полосы JSON", "Поправки подтверждены"])
+                    writer.writerow(["UUID", "RF1_Hz", "RF2_Hz", "LO_Hz", "LO_level_dBm", "Pin1_dBm", "Pavg_W", "PEP_W",
+                        "U_result_dB_k2", "IM3_low_dBc", "IM3_high_dBc", "Гармонические полосы JSON", "Поправки подтверждены"])
                     for point in self.points:
                         result, plan = point["result"], point["plan"]
-                        writer.writerow([point["spectrum_id"], plan["level1_dbm"] - plan["loss1_db"], result["output_average_w"],
-                            result["output_pep_w"], result["sides"]["low"]["im3_dbc"], result["sides"]["high"]["im3_dbc"],
+                        uncertainty = result.get("uncertainty", {})
+                        writer.writerow([point["spectrum_id"], plan["f1_hz"], plan["f1_hz"] + plan["spacing_hz"],
+                            plan["lo_hz"], plan["lo_dbm"], plan["level1_dbm"] - plan["loss1_db"], result["output_average_w"],
+                            result["output_pep_w"], uncertainty.get("expanded_uncertainty_k2_db"),
+                            result["sides"]["low"]["im3_dbc"], result["sides"]["high"]["im3_dbc"],
                             json.dumps(point["harmonics"], ensure_ascii=False), result["calibrated"]])
             except OSError as error:
                 self.status.setText("Ошибка CSV: " + str(error))

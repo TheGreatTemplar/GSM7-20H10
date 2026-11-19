@@ -1,5 +1,7 @@
 """Persistent point annotations shared by measurement plots."""
 
+import math
+
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 from shiboken6 import isValid
@@ -11,6 +13,7 @@ class PointHover(QtCore.QObject):
         self.plot, self.formatter = plot, formatter
         self.selection = None
         self.selected_scatter = None
+        self.scatters = []
         self.label = QtWidgets.QLabel(plot.viewport())
         self.label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self.label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -25,6 +28,7 @@ class PointHover(QtCore.QObject):
             }
         """)
         self.label.hide()
+        plot.viewport().setMouseTracking(True)
         self.lines = [QtWidgets.QGraphicsLineItem(), QtWidgets.QGraphicsLineItem()]
         for line in self.lines:
             line.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
@@ -38,10 +42,11 @@ class PointHover(QtCore.QObject):
 
     def attach(self, curve, x, y, data):
         curve.scatter.setData(x=x, y=y, data=data, hoverable=True, tip=None,
-            hoverSize=12, hoverBrush=pg.mkBrush("#f4bd61"))
-        if not getattr(curve, "point_hint_connected", False):
-            curve.scatter.sigHovered.connect(self.hovered)
-            curve.point_hint_connected = True
+            size=8, hoverSize=20, hoverBrush=pg.mkBrush("#f4bd61"))
+        channel = data[0].get("channel", 0) if data else 0
+        curve.scatter.setZValue(50 + channel)
+        if curve.scatter not in self.scatters:
+            self.scatters.append(curve.scatter)
 
     def hovered(self, scatter, points, event):
         if len(points) == 0:
@@ -68,8 +73,9 @@ class PointHover(QtCore.QObject):
         self.lines[1].setLine(left, y, x, y)
         for line in self.lines:
             line.show()
-        position = self.plot.mapFromScene(self.plot.getViewBox().mapViewToScene(QtCore.QPointF(x, y)))
         viewport = self.plot.viewport()
+        plot_position = self.plot.mapFromScene(self.plot.getViewBox().mapViewToScene(QtCore.QPointF(x, y)))
+        position = viewport.mapFromGlobal(self.plot.mapToGlobal(plot_position))
         width, height = self.label.width(), self.label.height()
         left = position.x() + 18
         if left + width > viewport.width() - 4:
@@ -90,6 +96,8 @@ class PointHover(QtCore.QObject):
     def forget(self, curve):
         if self.selected_scatter is curve.scatter:
             self.hide()
+        if curve.scatter in self.scatters:
+            self.scatters.remove(curve.scatter)
 
     def restore_lines(self):
         self.hide()
@@ -99,6 +107,27 @@ class PointHover(QtCore.QObject):
     def eventFilter(self, watched, event):
         if not isValid(self.plot):
             return False
-        if watched is self.plot.viewport() and event.type() in (QtCore.QEvent.Type.Leave, QtCore.QEvent.Type.Hide):
-            self.hide()
+        if watched is self.plot.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                viewport_point = event.position().toPoint()
+                plot_point = self.plot.viewport().mapTo(self.plot, viewport_point)
+                scene_point = self.plot.mapToScene(plot_point)
+                candidates = []
+                for scatter in tuple(self.scatters):
+                    if not isValid(scatter):
+                        self.scatters.remove(scatter)
+                        continue
+                    for point in scatter.points():
+                        point_scene = scatter.mapToScene(point.pos())
+                        distance = math.hypot(point_scene.x() - scene_point.x(), point_scene.y() - scene_point.y())
+                        if distance <= 12 and point.data() is not None:
+                            candidates.append((distance, -scatter.zValue(), scatter, point))
+                if candidates:
+                    _, _, scatter, point = min(candidates, key=lambda item: (item[0], item[1]))
+                    if self.selected_scatter is not scatter or self.selection != (point.pos().x(), point.pos().y()):
+                        self.hovered(scatter, [point], None)
+                else:
+                    self.hide()
+            elif event.type() in (QtCore.QEvent.Type.Leave, QtCore.QEvent.Type.Hide):
+                self.hide()
         return super().eventFilter(watched, event)

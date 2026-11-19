@@ -21,7 +21,7 @@ from .rf_methods import ISOLATION_PORTS, METHOD_CHOICES, injection_loss, injecti
 from .rf_sequence import active_channels, matrix_axes, plan_sequence, sequence_count
 from .rsa import AcquisitionCancelled, AnalyzerConfig, Rsa6265, average_spectra, demo_spectrum, frequencies, mixer_result
 from .smu import Smu200a, SourcePlan, verified_off
-from .table_filters import FilterHeader
+from .table_filters import FilterHeader, configure_table
 from .rf_archive import ArchiveLoader, archive_rows
 
 
@@ -586,9 +586,11 @@ class RsaWindow(QtWidgets.QWidget):
         self.archive_result_note.setWordWrap(True)
         archive_layout.addWidget(self.archive_result_note)
         self.archive_headers = ["Смеситель", "Партия", "Тип / модель", "Дата UTC", "Режим", "RF, МГц", "LO, МГц",
-            "ПЧ, МГц", "RF / IF, dBm", "LO, dBm", "Результат, дБ", "Статус", "Примечание", "Причина / условия расчёта"]
+            "ПЧ, МГц", "RF / IF, dBm", "LO, dBm", "Результат, дБ", "Статус", "Примечание",
+            "Причина / условия расчёта", "U результата, дБ (k=2)"]
         self.table = QtWidgets.QTableWidget(0, len(self.archive_headers))
         self.table.setHorizontalHeader(FilterHeader(self.table))
+        configure_table(self.table)
         self.table.setHorizontalHeaderLabels(self.archive_headers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1130,7 +1132,7 @@ class RsaWindow(QtWidgets.QWidget):
                 values, missing = self.archive_rows[row]
                 for column, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
-                    if column in (10, 11, 13):
+                    if column in (10, 13, 14):
                         item.setToolTip(values[13])
                         if missing:
                             item.setForeground(QtGui.QColor("#f4bd61"))

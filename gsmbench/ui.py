@@ -17,7 +17,7 @@ from .instrument import Instrument, SocketTransport, VisaTransport
 from .storage import Store, new_run
 from .help_ui import AboutDialog, HelpDialog
 from .rsa_ui import RsaWindow
-from .table_filters import FilterHeader
+from .table_filters import FilterHeader, configure_table
 from .detector_ui import DetectorPanel
 from .window_chrome import install_window_chrome
 from .button_hints import install_button_hints
@@ -633,6 +633,7 @@ class Window(QtWidgets.QMainWindow):
         self.table = QtWidgets.QTableWidget(0, 8)
         self.table_headers = ["Образец", "Марка", "Партия", "Метод", "Дата UTC", "Статус", "Точек", "Результат"]
         self.table.setHorizontalHeader(FilterHeader(self.table))
+        configure_table(self.table)
         self.table.setHorizontalHeaderLabels(self.table_headers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)

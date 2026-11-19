@@ -3,6 +3,25 @@
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
+def configure_table(table):
+    """Use the same text origin in headers and cells, with visible column rules."""
+    table.setShowGrid(True)
+    table.setGridStyle(QtCore.Qt.PenStyle.SolidLine)
+    table.horizontalHeader().setDefaultAlignment(
+        QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+    table.setStyleSheet("""
+        QTableView
+        {
+            gridline-color: #48596d;
+        }
+        QHeaderView::section
+        {
+            border-right: 1px solid #586b82;
+            border-bottom: 1px solid #586b82;
+        }
+    """)
+
+
 class FilterHeader(QtWidgets.QHeaderView):
     def __init__(self, parent):
         super().__init__(QtCore.Qt.Orientation.Horizontal, parent)
@@ -26,4 +45,7 @@ class FilterHeader(QtWidgets.QHeaderView):
         painter.setFont(font)
         text = self.model().headerData(logical_index, self.orientation(), QtCore.Qt.ItemDataRole.DisplayRole)
         painter.drawText(rect.adjusted(6, 0, -5, 0), QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, str(text or ""))
+        painter.setPen(QtGui.QColor("#586b82"))
+        painter.drawLine(rect.topRight(), rect.bottomRight())
+        painter.drawLine(rect.bottomLeft(), rect.bottomRight())
         painter.restore()

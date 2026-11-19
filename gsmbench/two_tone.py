@@ -2,11 +2,102 @@
 
 from dataclasses import dataclass
 import math
+import re
 import statistics
 
 from .mixer import ip3
 from .rsa import AnalyzerConfig, frequencies, peak_near
 from .validation import FieldError
+
+
+def parse_frequency_ranges(text, maximum_points=201):
+    """Parse MHz entries such as '1.810..2.000/0.095; 50..52/1'."""
+    if not text.strip():
+        return []
+    frequencies = []
+    for entry in text.split(";"):
+        entry = entry.strip().replace(",", ".")
+        if not entry:
+            continue
+        if "/" in entry:
+            if entry.count("/") != 1:
+                raise FieldError("Формат диапазона: начало..конец/шаг", "frequency_ranges")
+            range_text, step_text = (part.strip() for part in entry.split("/", 1))
+            match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\.\.|[–—-])\s*([0-9]+(?:\.[0-9]+)?)\s*", range_text)
+            if not match:
+                raise FieldError("Формат диапазона: начало..конец/шаг", "frequency_ranges")
+            try:
+                start, stop, step = float(match[1]), float(match[2]), float(step_text)
+            except ValueError as error:
+                raise FieldError("Шаг частоты должен быть числом в МГц", "frequency_ranges") from error
+            if not all(math.isfinite(value) for value in (start, stop, step)) or start <= 0 or stop < start or step <= 0:
+                raise FieldError("В диапазоне нужны положительные частоты и шаг", "frequency_ranges")
+            count = math.floor((stop - start) / step + 1e-9) + 1
+            if count > maximum_points:
+                raise FieldError(f"В списке допускается не более {maximum_points} частот", "frequency_ranges")
+            values = [start + index * step for index in range(count)]
+            if not math.isclose(values[-1], stop, abs_tol=1e-9, rel_tol=0):
+                values.append(stop)
+            frequencies.extend(values)
+        else:
+            try:
+                value = float(entry)
+            except ValueError as error:
+                raise FieldError("Укажите частоту в МГц или диапазон начало..конец/шаг", "frequency_ranges") from error
+            if not math.isfinite(value) or value <= 0:
+                raise FieldError("Частоты должны быть положительными", "frequency_ranges")
+            frequencies.append(value)
+        if len(frequencies) > maximum_points:
+            raise FieldError(f"В списке допускается не более {maximum_points} частот", "frequency_ranges")
+    frequencies = [value * 1e6 for value in frequencies]
+    if len(set(frequencies)) != len(frequencies):
+        raise FieldError("В диапазонах есть повторяющиеся частоты", "frequency_ranges")
+    if any(not 0.1e6 <= value <= 200e6 for value in frequencies):
+        raise FieldError("Частоты RF должны быть в диапазоне 0,1…200 МГц", "frequency_ranges")
+    return frequencies
+
+
+def parse_level_ranges(text, fallback, maximum_points=201):
+    """Parse optional dBm entries and ranges such as '10..20/1; 13'."""
+    if not text.strip():
+        return [fallback]
+    values = []
+    for entry in text.split(";"):
+        entry = entry.strip().replace(",", ".")
+        if not entry:
+            continue
+        if "/" not in entry:
+            try:
+                values.append(float(entry))
+            except ValueError as error:
+                raise FieldError("Формат уровня: число или начало..конец/шаг", "lo_levels") from error
+            continue
+        if entry.count("/") != 1:
+            raise FieldError("Формат уровня: начало..конец/шаг", "lo_levels")
+        range_text, step_text = (part.strip() for part in entry.split("/", 1))
+        match = re.fullmatch(r"\s*(-?[0-9]+(?:\.[0-9]+)?)\s*\.\.\s*(-?[0-9]+(?:\.[0-9]+)?)\s*", range_text)
+        if not match:
+            raise FieldError("Формат уровня: начало..конец/шаг", "lo_levels")
+        try:
+            start, stop, step = float(match[1]), float(match[2]), float(step_text)
+        except ValueError as error:
+            raise FieldError("Шаг уровня должен быть числом в dBm", "lo_levels") from error
+        if not all(math.isfinite(value) for value in (start, stop, step)) or stop < start or step <= 0:
+            raise FieldError("Для уровня нужен возрастающий диапазон и положительный шаг", "lo_levels")
+        count = math.floor((stop - start) / step + 1e-9) + 1
+        if count > maximum_points:
+            raise FieldError(f"Допускается не более {maximum_points} уровней LO", "lo_levels")
+        sequence = [start + index * step for index in range(count)]
+        if not math.isclose(sequence[-1], stop, abs_tol=1e-9, rel_tol=0):
+            sequence.append(stop)
+        values.extend(sequence)
+        if len(values) > maximum_points:
+            raise FieldError(f"Допускается не более {maximum_points} уровней LO", "lo_levels")
+    if not values or any(not math.isfinite(value) or not -110 <= value <= 20 for value in values):
+        raise FieldError("Уровни LO должны быть в диапазоне −110…+20 dBm", "lo_levels")
+    if len(set(values)) != len(values):
+        raise FieldError("В списке уровней LO есть повторяющиеся значения", "lo_levels")
+    return values
 
 
 @dataclass(frozen=True)
