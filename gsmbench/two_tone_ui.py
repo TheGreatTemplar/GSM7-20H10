@@ -15,15 +15,17 @@ import pyqtgraph.exporters
 
 from .rf_storage import SpectrumStore
 from .uncertainty import result_uncertainty
-from .rsa import AcquisitionCancelled, Rsa6265, demo_spectrum, frequencies
+from .rsa import AcquisitionCancelled, Rsa6265, average_spectra, demo_spectrum, frequencies
 from .smu import Smu200a, SourcePlan, verified_off
 from .ssg import Ssg3000x, verified_ssg_off
+from .smr import lo_source, verified_lo_off
 from .two_tone import TwoTonePlan, analyze_two_tone, harmonic_band, parse_frequency_ranges, parse_level_ranges
 from .source_calibration import PowerCalibrationWorker, calibrated_source_plan
 from .source_calibration_ui import PowerCalibrationPanel
 from .form_layout import compact_inputs
 from .validation import FieldError, FieldFeedback, StatusLabel
 from .rf_labels import INPUT_ATTENUATION_A, INPUT_ATTENUATION_B, INPUT_ATTENUATION_HINT, RSA_ATTENUATION, SMU_LEVEL
+from .two_tone_results import TwoToneResults, columns, row_values
 
 
 class TwoToneWorker(QtCore.QThread):
@@ -41,14 +43,18 @@ class TwoToneWorker(QtCore.QThread):
     def run(self):
         smu, akip, rsa = None, None, None
         owns = self.operation in ("measure", "off")
+        needs_lo = self.operation == "identify" or self.settings.get("lo_required",
+            self.operation == "off" or not self.plans or any(plan.mode == "mixer" for plan in self.plans))
         enable_attempted = False
         series = str(uuid.uuid4())
         try:
             if not self.settings["demo"]:
-                akip = Ssg3000x(self.settings["akip_host"], self.settings["akip_port"], self.log.emit)
+                if needs_lo:
+                    akip = (lo_source(self.settings, self.log.emit) if self.settings.get("lo_source") == "smr" else
+                        Ssg3000x(self.settings["akip_host"], self.settings["akip_port"], self.log.emit))
                 if self.operation == "identify":
                     state = akip.state()
-                    self.status.emit("АКИП: " + json.dumps(state, ensure_ascii=False))
+                    self.status.emit("Источник LO: " + json.dumps(state, ensure_ascii=False))
                     self.outputs.emit(dict(known=True, active=bool(state["output"])))
                     return
                 smu = Smu200a(self.settings["smu_host"], self.settings["smu_port"], self.log.emit)
@@ -56,7 +62,8 @@ class TwoToneWorker(QtCore.QThread):
                 if self.operation == "measure" and profile and smu.identity != profile["generator_identity"]:
                     raise ValueError("Профиль калибровки снят другим SMU; паспорт прибора не совпадает")
                 smu.all_off()
-                akip.off()
+                if akip:
+                    akip.off()
             if self.operation in ("off", "identify"):
                 self.status.emit("ДЕМО источников" if self.settings["demo"] else "Источники отключены")
                 return
@@ -81,7 +88,7 @@ class TwoToneWorker(QtCore.QThread):
             for index, plan in enumerate(self.plans):
                 if self.stop.is_set():
                     raise AcquisitionCancelled()
-                if previous and plan.mode == "pa":
+                if previous and plan.mode == "pa" and plan.f1_hz == self.plans[index - 1].f1_hz:
                     predicted = previous["result"]["output_average_w"] * 10 ** ((plan.level1_dbm - self.plans[index - 1].level1_dbm) / 10)
                     if predicted > plan.max_output_w:
                         self.status.emit("Следующий шаг превысит заданный предел мощности; серия завершена")
@@ -89,7 +96,7 @@ class TwoToneWorker(QtCore.QThread):
                 generator, generator2 = {}, {}
                 if smu:
                     generator = smu.setpoint(self.source_plan(plan))
-                    generator2 = akip.setpoint(plan.lo_hz, plan.lo_dbm) if plan.mode == "mixer" else akip.state()
+                    generator2 = akip.setpoint(plan.lo_hz, plan.lo_dbm) if plan.mode == "mixer" else dict(output=0, identity="LO not used")
                     if not active:
                         enable_attempted = True
                         if plan.mode == "mixer":
@@ -103,7 +110,7 @@ class TwoToneWorker(QtCore.QThread):
                 if self.stop.wait(self.settings["settling_s"]):
                     raise AcquisitionCancelled()
                 spectrum = self.capture(rsa, plan, 1)
-                if smu and (smu.state() != generator or akip.state() != generator2):
+                if smu and (smu.state() != generator or (akip is not None and akip.state() != generator2)):
                     raise ValueError("Источники изменились во время развёртки")
                 context = dict(sample=self.settings["sample"], batch=self.settings["batch"], model=self.settings["model"],
                     notes=self.settings["notes"], method="two_tone_" + plan.mode, rf_hz=plan.f1_hz,
@@ -113,9 +120,11 @@ class TwoToneWorker(QtCore.QThread):
                     pin_dbm=plan.level1_dbm - plan.loss1_db, output_loss_db=plan.output_loss_db,
                     marker_window_hz=min(plan.rbw_hz * 3, plan.spacing_hz * 0.2),
                     two_tone_plan=asdict(plan), series_id=series, series_index=index,
-                    sources="SMU200A A+B; AKIP3208 LO" if plan.mode == "mixer" else "SMU200A A+B; AKIP3208 OFF",
+                    sources="SMU200A A+B; " + (("SMR20" if self.settings.get("lo_source") == "smr" else "AKIP3208") + " LO" if plan.mode == "mixer" else "LO not used"),
                     source_layout="smu_ab_akip_lo", tone1_channel=1, tone2_channel=2,
-                    rf_channel=1, lo_source="AKIP3208" if plan.mode == "mixer" else None, sweep_kind="two_tone_power")
+                    rf_channel=1, lo_source=("SMR20" if self.settings.get("lo_source") == "smr" else "AKIP3208") if plan.mode == "mixer" else None,
+                    lo_endpoint={key: self.settings[key] for key in ("lo_source", "smr_port", "smr_baud", "akip_host", "akip_port") if key in self.settings},
+                    sweep_kind="two_tone_power")
                 if self.settings.get("power_calibration"):
                     profile = self.settings["power_calibration"]
                     context["source_calibration"] = dict(id=profile["id"], method=profile["plan"]["method"],
@@ -150,7 +159,7 @@ class TwoToneWorker(QtCore.QThread):
                         if self.stop.is_set():
                             raise AcquisitionCancelled()
                         harmonic = self.capture(rsa, plan, order)
-                        if smu and (smu.state() != generator or akip.state() != generator2):
+                        if smu and (smu.state() != generator or (akip is not None and akip.state() != generator2)):
                             raise ValueError("Источники изменились во время измерения гармоник")
                         band = harmonic_band(harmonic, plan, order)
                         fundamental_name = "fund_low" if result["fundamental_low_dbm"] >= result["fundamental_high_dbm"] else "fund_high"
@@ -177,7 +186,9 @@ class TwoToneWorker(QtCore.QThread):
             if owns:
                 errors = []
                 # Always attempt both instruments even if one fails.
-                for driver, off, label in ((akip, verified_ssg_off, "АКИП"), (smu, verified_off, "SMU")):
+                for driver, off, label in ((akip, verified_lo_off, "Источник LO"), (smu, verified_off, "SMU")):
+                    if label == "Источник LO" and not needs_lo:
+                        continue
                     if driver:
                         try:
                             off(driver)
@@ -207,6 +218,15 @@ class TwoToneWorker(QtCore.QThread):
         return SourcePlan(plan.f1_hz, plan.f2_hz, plan.level1_dbm, plan.level2_dbm, 1, 2)
 
     def capture(self, rsa, plan, order):
+        if plan.sweep_averages > 1:
+            single = replace(plan, sweep_averages=1)
+            sweeps = []
+            for index in range(plan.sweep_averages):
+                if self.stop.is_set():
+                    raise AcquisitionCancelled()
+                self.status.emit(f"H{order}: развёртка {index + 1}/{plan.sweep_averages}")
+                sweeps.append(self.capture(rsa, single, order))
+            return average_spectra(sweeps, dict(method="spectrum"))
         config = plan.analyzer_config(order)
         actual = rsa.configure(config) if rsa else None
         spectrum = rsa.acquire(self.stop) if rsa else demo_spectrum(config)
@@ -323,13 +343,34 @@ class TwoTonePanel(QtWidgets.QWidget):
         paired_row("Второй тон · SMU B/2", "Частота, МГц", self.f2_mhz, SMU_LEVEL, level2)
         add("spacing_hz", "Интервал тонов, Гц", 2000, 100, 100000, 0)
         lo = add("lo_mhz", "LO для смесителя, МГц", 25.0592, 0.1, 3070, 6, place=False)
-        lo_level = add("lo_dbm", "АКИП · уровень LO, dBm", 13, -110, 20, place=False)
-        self.lo_group = paired_row("LO смесителя · АКИП", "Частота, МГц", lo, "Уровень, dBm", lo_level)
-        frequency_ranges = QtWidgets.QLineEdit()
-        frequency_ranges.setPlaceholderText("например: 1.810..2.000/0.095; 50..52/1")
-        frequency_ranges.setToolTip("Диапазоны через точку с запятой; формат начало..конец/шаг, МГц. Можно указать одну частоту. "
-            "При серии для смесителя LO автоматически задаётся выше RF на выбранную ПЧ.")
-        add("frequency_ranges", "RF диапазоны и шаг, МГц", frequency_ranges)
+        lo_level = add("lo_dbm", "Уровень источника LO, dBm", 13, -110, 20, place=False)
+        self.lo_group = paired_row("LO смесителя · отдельный генератор", "Частота, МГц", lo, "Уровень, dBm", lo_level)
+        frequency_ranges = QtWidgets.QPlainTextEdit()
+        frequency_ranges.setFixedHeight(100)
+        frequency_ranges.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        frequency_ranges.setPlaceholderText("14; 14.175; 14.35\n50..52/1")
+        frequency_ranges.setToolTip(
+            "ЧАСТОТЫ ПЕРВОГО ТОНА, МГц\n\n"
+            "Отдельные частоты:\n14; 14.175; 14.35\n"
+            "Это три измерения: 14,000 / 14,175 / 14,350 МГц.\n\n"
+            "Диапазон с шагом:\n50..52/1\n"
+            "Это 50 / 51 / 52 МГц: от 50 до 52 с шагом 1 МГц.\n\n"
+            "Можно сочетать строки:\n1.810; 1.905; 2\n50..52/1\n\n"
+            "Когда поле заполнено, оно задаёт частоты первого тона.\n"
+            "Верхние поля частот показывают первую пару серии.\n"
+            "Второй тон всегда выше первого на заданный интервал.\n"
+            "Например, при интервале 2000 Гц: 14,000 и 14,002 МГц.\n"
+            "Пустое поле: одна пара с частотой из верхнего поля.\n"
+            "Уровни обоих тонов сверху действуют для всей серии.\n"
+            "Для смесителя в частотной серии LO = первый тон + ПЧ.")
+        self.fields["frequency_ranges"] = frequency_ranges
+        form.addRow(QtWidgets.QLabel("Частоты первого тона / диапазоны и шаг, МГц"))
+        form.addRow(frequency_ranges)
+        self.frequency_summary = QtWidgets.QLabel()
+        self.frequency_summary.setWordWrap(True)
+        form.addRow(self.frequency_summary)
+        self.single_frequency_mhz = first.value()
+        frequency_ranges.textChanged.connect(self.update_frequency_mode)
         add("if_mhz", "ПЧ для частотной серии, МГц", 11.0592, 0.1, 3000, 6)
         self.fields["if_mhz"].setToolTip("Для каждой частоты серии задаётся LO = RF + ПЧ. Одиночное измерение использует частоту LO выше.")
         lo_levels = QtWidgets.QLineEdit()
@@ -346,37 +387,44 @@ class TwoTonePanel(QtWidgets.QWidget):
             self.fields[key].setToolTip(INPUT_ATTENUATION_HINT.format(channel=channel))
         add("output_loss", RSA_ATTENUATION, 40, 0, 100)
         add("pad_rating", "Мощность первого аттенюатора, Вт", 10, 0, 100)
-        add("max_w", "Предел средней мощности PA, Вт", 7, 0.01, 7)
+        add("max_w", "Предел средней мощности PA, Вт", 7, 0.001, 7, 3)
         add("harmonics", "Гармонические полосы до H", 5, 1, 7, 0)
         add("calibrated", "Поправки трактов проверены на частотах измерений", False)
         add("wiring", "Схема подключена: сумматор, нагрузки и аттенюаторы проверены", False)
         add("sweep", "Серия: повышать оба тона одинаковыми шагами", False)
         add("drive_stop", "Последний уровень тона 1, dBm", -10, -110, 20)
-        add("drive_step", "Шаг уровней, дБ", 1, 0.1, 1)
+        add("drive_step", "Шаг уровней, дБ", 1, 0.1, 20)
+        add("sweep_averages", "Независимых развёрток на полосу", 5, 1, 50, 0)
         for widget in self.fields.values():
             signal = (widget.currentIndexChanged if isinstance(widget, QtWidgets.QComboBox) else
                 widget.toggled if isinstance(widget, QtWidgets.QCheckBox) else
-                widget.textChanged if isinstance(widget, QtWidgets.QLineEdit) else widget.valueChanged)
+                widget.textChanged if isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit)) else widget.valueChanged)
             signal.connect(lambda *args: self.settings_changed.emit())
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.wiring = QtWidgets.QLabel()
         self.wiring.setWordWrap(True)
         form.addRow(self.wiring)
-        buttons = QtWidgets.QHBoxLayout()
+        buttons = QtWidgets.QGridLayout()
         right.addLayout(buttons)
         self.preset = QtWidgets.QPushButton("Предустановка RSA для двух тонов")
         self.preset.clicked.connect(self.analyzer_preset)
-        buttons.addWidget(self.preset)
+        buttons.addWidget(self.preset, 0, 0)
         self.start_button = QtWidgets.QPushButton("Измерить два тона")
         self.start_button.clicked.connect(self.start)
-        buttons.addWidget(self.start_button)
+        buttons.addWidget(self.start_button, 1, 0)
+        self.driver_preset_button = QtWidgets.QPushButton("Шаблон BGA616 · 14 МГц")
+        self.driver_preset_button.clicked.connect(self.driver_preset)
+        buttons.addWidget(self.driver_preset_button, 0, 1)
         self.stop_button = QtWidgets.QPushButton("СТОП · оба генератора OFF")
         self.stop_button.clicked.connect(self.stop)
-        buttons.addWidget(self.stop_button)
-        self.plot = pg.PlotWidget()
-        self.plot.showGrid(x=True, y=True, alpha=0.2)
-        self.plot.addLegend()
-        right.addWidget(self.plot, 1)
+        buttons.addWidget(self.stop_button, 1, 1)
+        self.results = TwoToneResults(self)
+        self.plot = self.results.plot
+        self.table = self.results.table
+        right.addWidget(self.results, 1)
+        self.results.metric_selector.currentIndexChanged.connect(lambda: self.settings_changed.emit())
+        self.results.x_axis.currentIndexChanged.connect(lambda: self.settings_changed.emit())
+        self.results.splitter.splitterMoved.connect(lambda: self.settings_changed.emit())
         tools = QtWidgets.QHBoxLayout()
         right.addLayout(tools)
         for title, callback in (("Мощность и PEP", self.plot_power), ("IM3 и гармоники", self.plot_distortion),
@@ -392,7 +440,7 @@ class TwoTonePanel(QtWidgets.QWidget):
         right.addWidget(self.summary)
         right.addWidget(self.status)
         self.manual_off_button = QtWidgets.QPushButton("Подтвердить RF OFF обоих генераторов вручную")
-        self.manual_off_button.setToolTip("Только после физической проверки: оба выхода SMU и RF-выход АКИП отключены.")
+        self.manual_off_button.setToolTip("Только после физической проверки: оба выхода SMU и RF-выход выбранного источника LO отключены.")
         self.manual_off_button.clicked.connect(self.confirm_manual_off)
         self.manual_off_button.hide()
         right.addWidget(self.manual_off_button)
@@ -406,7 +454,7 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.calibration.changed.connect(lambda: self.settings_changed.emit())
         for key in ("f1_mhz", "spacing_hz", "loss1", "loss2", "frequency_ranges", "if_mhz"):
             widget = self.fields[key]
-            signal = widget.textChanged if isinstance(widget, QtWidgets.QLineEdit) else widget.valueChanged
+            signal = widget.textChanged if isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit)) else widget.valueChanged
             signal.connect(lambda: self.calibration.confirm.setChecked(False))
         self.bench.demo.toggled.connect(self.calibration.reload)
         self.calibration.reload()
@@ -414,15 +462,45 @@ class TwoTonePanel(QtWidgets.QWidget):
         compact_inputs(self.form_widget)
 
     def settings(self):
-        return dict(source_layout="smu_ab_akip_lo", power_calibration=self.calibration.settings(),
+        return dict(source_layout="smu_ab_akip_lo", power_calibration=self.calibration.settings(), results_view=self.results.settings(),
+            single_frequency_mhz=self.single_frequency_mhz,
             **{key: widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else
                 widget.isChecked() if isinstance(widget, QtWidgets.QCheckBox) else
-                widget.text().strip() if isinstance(widget, QtWidgets.QLineEdit) else widget.value()
+                widget.text().strip() if isinstance(widget, QtWidgets.QLineEdit) else
+                widget.toPlainText().strip() if isinstance(widget, QtWidgets.QPlainTextEdit) else widget.value()
                 for key, widget in self.fields.items() if key != "wiring"})
 
     def update_second_tone(self):
+        if not self.fields["frequency_ranges"].toPlainText().strip():
+            self.single_frequency_mhz = self.fields["f1_mhz"].value()
         frequency = self.fields["f1_mhz"].value() + self.fields["spacing_hz"].value() / 1e6
         self.f2_mhz.setText(f"{frequency:.6f}".replace(".", ","))
+        self.update_frequency_mode()
+
+    def update_frequency_mode(self):
+        text = self.fields["frequency_ranges"].toPlainText().strip()
+        first = self.fields["f1_mhz"]
+        first.setEnabled(not bool(text))
+        blocker = QtCore.QSignalBlocker(first)
+        if not text:
+            first.setValue(self.single_frequency_mhz)
+            frequency = first.value() + self.fields["spacing_hz"].value() / 1e6
+            self.f2_mhz.setText(f"{frequency:.6f}".replace(".", ","))
+            self.frequency_summary.setText("Одна пара: частоту первого тона задаёт поле сверху. Второй = первый + интервал.")
+        else:
+            try:
+                frequencies_hz = parse_frequency_ranges(text)
+                if not frequencies_hz:
+                    raise ValueError("Укажите частоты или очистите поле")
+                first.setValue(frequencies_hz[0] / 1e6)
+                second = frequencies_hz[0] / 1e6 + self.fields["spacing_hz"].value() / 1e6
+                self.f2_mhz.setText(f"{second:.6f}".replace(".", ","))
+                self.frequency_summary.setText(f"Серия: {len(frequencies_hz)} частот. Сверху показана первая пара: "
+                    f"{first.value():g} / {second:g} МГц. Уровни сверху применяются ко всем парам.")
+            except ValueError as error:
+                self.f2_mhz.setText("—")
+                self.frequency_summary.setText("Ошибка списка частот: " + str(error))
+        del blocker
 
     def restore(self, settings):
         for key, value in settings.items():
@@ -434,16 +512,20 @@ class TwoTonePanel(QtWidgets.QWidget):
                 widget.setCurrentIndex(max(0, widget.findData(value)))
             elif isinstance(widget, QtWidgets.QCheckBox):
                 widget.setChecked(bool(value))
+            elif isinstance(widget, QtWidgets.QPlainTextEdit):
+                widget.setPlainText(str(value))
             elif isinstance(widget, QtWidgets.QLineEdit):
                 widget.setText(str(value))
             else:
                 widget.setValue(value)
             del blocker
+        self.single_frequency_mhz = settings.get("single_frequency_mhz", settings.get("f1_mhz", 14))
         self.mode_changed(reset=False)
         self.update_second_tone()
         if settings.get("source_layout") != "smu_ab_akip_lo":
             self.fields["calibrated"].setChecked(False)
         self.calibration.restore(settings.get("power_calibration", {}))
+        self.results.restore(settings.get("results_view", {}))
 
     def mode_changed(self, *args, reset=True):
         pa = self.mode.currentData() == "pa"
@@ -461,9 +543,9 @@ class TwoTonePanel(QtWidgets.QWidget):
             self.fields["output_loss"].setValue(40 if pa else 0)
         self.fields["wiring"].setChecked(False)
         self.wiring.setText("PA: SMU A/1 и B/2 → резистивный сумматор → PA → 20 дБ / 10 Вт → ещё 20 дБ → RSA. "
-            "АКИП выключен. Ослабления трактов A/B включают кабели, аттенюаторы и комбинер. "
+            "Отдельный источник LO выключен. Ослабления трактов A/B включают кабели, аттенюаторы и комбинер. "
             "Гармоники означают максимум в полосе n·f1…n·f2, это не THD." if pa else
-            "Смеситель: SMU A/1 и B/2 → сумматор → RF; АКИП → LO; IF → RSA. "
+            "Смеситель: SMU A/1 и B/2 → сумматор → RF; выбранный генератор → LO; IF → RSA. "
             "Собственные IM3 источников и сумматора нужно измерить без DUT для проверки динамического диапазона стенда.")
 
     def analyzer_preset(self):
@@ -474,6 +556,32 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.bench.points.setValue(3201)
         self.status.setText("Настройки RSA заполнены; приборы пока не менялись.")
 
+    def driver_preset(self):
+        self.mode.setCurrentIndex(self.mode.findData("pa"))
+        self.calibration.use_profile.setChecked(False)
+        self.fields["calibrated"].setChecked(False)
+        self.fields["loss1"].setValue(16)
+        self.fields["loss2"].setValue(16)
+        self.fields["output_loss"].setValue(20)
+        self.fields["max_w"].setValue(0.05)
+        self.fields["level1"].setValue(6)
+        self.fields["level2"].setValue(6)
+        self.fields["drive_stop"].setValue(16)
+        self.fields["drive_step"].setValue(1)
+        self.fields["sweep"].setChecked(True)
+        self.fields["frequency_ranges"].setPlainText("14; 14.175; 14.35")
+        self.fields["spacing_hz"].setValue(2000)
+        self.fields["harmonics"].setValue(7)
+        self.fields["sweep_averages"].setValue(5)
+        for widget in (self.bench.rbw_hz, self.bench.vbw_hz):
+            widget.setCurrentIndex(widget.findData(100))
+        self.bench.detector.setCurrentIndex(self.bench.detector.findData("RMS"))
+        self.bench.attenuation_db.setValue(10)
+        self.bench.reference_dbm.setValue(0)
+        self.bench.points.setValue(3201)
+        self.fields["wiring"].setChecked(False)
+        self.status.setText("Шаблон BGA616: вход −10…0 dBm/тон, SMU +6…+16 dBm, 14 МГц, H7, ×5. Проверьте ослабления и схему.")
+
     def plans(self):
         data = self.settings()
         plan = TwoTonePlan(mode=data["mode"], f1_hz=data["f1_mhz"] * 1e6, spacing_hz=data["spacing_hz"],
@@ -482,7 +590,8 @@ class TwoTonePanel(QtWidgets.QWidget):
             output_loss_db=data["output_loss"], pad_rating_w=data["pad_rating"], max_output_w=data["max_w"],
             rbw_hz=self.bench.rbw_hz.currentData(), attenuation_db=self.bench.attenuation_db.value(),
             reference_dbm=self.bench.reference_dbm.value(), points=self.bench.points.value(),
-            harmonics=int(data["harmonics"]) if data["mode"] == "pa" else 1, calibrated=data["calibrated"])
+            harmonics=int(data["harmonics"]) if data["mode"] == "pa" else 1, calibrated=data["calibrated"],
+            sweep_averages=int(data.get("sweep_averages", 5)), detector=self.bench.detector.currentData())
         frequencies_hz = parse_frequency_ranges(data.get("frequency_ranges", "")) or [plan.f1_hz]
         lo_levels = ([data["lo_dbm"]] if data["mode"] == "pa" else
             parse_level_ranges(data.get("lo_levels", ""), data["lo_dbm"]))
@@ -527,7 +636,12 @@ class TwoTonePanel(QtWidgets.QWidget):
             if operation == "measure" and not self.bench.demo.isChecked() and not self.fields["wiring"].isChecked():
                 raise FieldError("Сначала подключите схему и подтвердите сумматор, нагрузку и выходные аттенюаторы", "wiring")
             data = self.bench.settings()
+            if operation == "measure" and data.get("lo_source") == "smr" and any(
+                    plan.mode == "mixer" and not 10e6 <= plan.lo_hz <= 20e9 for plan in plans):
+                raise FieldError("SMR20: частота LO должна быть от 10 МГц до 20 ГГц", "lo_mhz", "if_mhz", "frequency_ranges")
             settings = dict(root=str(self.bench.root), database=str(self.bench.store().path), demo=data["demo"],
+                lo_required=self.mode.currentData() == "mixer",
+                lo_source=data.get("lo_source", "akip"), smr_port=data.get("smr_port", "COM3"), smr_baud=data.get("smr_baud", 19200),
                 smu_host=data["smu_host"], smu_port=data["smu_port"], akip_host=data["akip_host"], akip_port=data["akip_port"],
                 rsa_host=data["host"], rf_channel=data["rf_channel"], lo_channel=data["lo_channel"],
                 sample=data["sample"], batch=data["batch"], model=data["model"], notes=data["notes"], settling_s=data["settling_s"])
@@ -556,11 +670,12 @@ class TwoTonePanel(QtWidgets.QWidget):
                 settings = self.last_settings
             if operation == "measure":
                 self.points = []
-                self.plot.clear()
+                self.results.update_points()
             self.last_settings = settings
             self.form_widget.setEnabled(False)
             self.start_button.setEnabled(False)
             self.preset.setEnabled(False)
+            self.driver_preset_button.setEnabled(False)
             self.calibration.set_busy(True)
             self.busy_changed.emit(True)
             self.worker = (PowerCalibrationWorker(self, settings, calibration_plan) if operation == "calibrate"
@@ -578,6 +693,8 @@ class TwoTonePanel(QtWidgets.QWidget):
             else:
                 self.worker.point_ready.connect(self.received)
             self.worker.finished.connect(self.finished)
+            if operation == 'identify':
+                self.bench.lo_connection_button.watch(self.worker, settings['demo'])
             self.worker.start()
         except Exception as error:
             self.error(error)
@@ -593,8 +710,10 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.unsafe_outputs = state.get("requires_off", not state["known"] or state["active"])
         if self.worker and self.worker.operation in ("measure", "off", "calibrate") and not self.unsafe_outputs and state["known"]:
             self.bench.generator_active = False
-            self.bench.smu_status.setText("SMU: RF OFF подтверждён; АКИП в калибровке не управлялся"
-                if self.worker.operation == "calibrate" else "SMU и АКИП: RF OFF подтверждён")
+            self.bench.smu_status.setText("SMU: RF OFF подтверждён; отдельный источник LO в калибровке не управлялся"
+                if self.worker.operation == "calibrate" else "SMU: RF OFF подтверждён; LO не используется"
+                if self.worker.plans and all(plan.mode == "pa" for plan in self.worker.plans)
+                else "SMU и выбранный источник LO: RF OFF подтверждён")
 
     def received(self, point):
         self.points.append(point)
@@ -612,9 +731,9 @@ class TwoTonePanel(QtWidgets.QWidget):
             f"уровней LO: {lo_count} · "
             f"Pср по основным тонам {result['output_average_w']:.4g} Вт · "
             f"PEP по основным тонам {result['output_pep_w']:.4g} Вт. "
-            + ("Поправки подтверждены. " if result["calibrated"] else "Использованы номинальные поправки; IP3 не рассчитывается. ")
+            + ("Поправки подтверждены; IP3 — экстраполяционная оценка. " if result["calibrated"] else "IP3 оценён по номинальным ослаблениям. ")
             + uncertainty_text + power_text)
-        self.plot_power()
+        self.results.update_points()
 
     def stop(self):
         if self.worker:
@@ -630,6 +749,7 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.form_widget.setEnabled(not self.unsafe_outputs)
         self.start_button.setEnabled(not self.unsafe_outputs)
         self.preset.setEnabled(not self.unsafe_outputs)
+        self.driver_preset_button.setEnabled(not self.unsafe_outputs)
         self.calibration.set_busy(self.unsafe_outputs)
         if calibrated:
             profile = getattr(self.calibration, "current_profile", None)
@@ -653,6 +773,7 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.form_widget.setEnabled(True)
         self.start_button.setEnabled(True)
         self.preset.setEnabled(True)
+        self.driver_preset_button.setEnabled(True)
         self.calibration.set_busy(False)
         self.manual_off_button.hide()
         self.busy_changed.emit(False)
@@ -660,69 +781,10 @@ class TwoTonePanel(QtWidgets.QWidget):
         self.bench.log.appendPlainText(self.status.text())
 
     def plot_power(self):
-        self.plot.clear()
-        if not self.points:
-            return
-        self._show_legend()
-        groups = {}
-        for point in self.points:
-            plan = point["plan"]
-            groups.setdefault((plan["f1_hz"], plan["lo_dbm"]), []).append(point)
-        for index, ((frequency, lo_dbm), points) in enumerate(sorted(groups.items())):
-            points.sort(key=lambda point: point["plan"]["level1_dbm"])
-            x = [point["plan"]["level1_dbm"] - point["plan"]["loss1_db"] for point in points]
-            color = pg.intColor(index, hues=max(1, len(groups)))
-            label_prefix = f"{frequency / 1e6:g} МГц · LO {lo_dbm:g} dBm"
-            self.plot.plot(x, [point["result"]["output_average_w"] for point in points],
-                pen=pg.mkPen(color, width=2), symbol="o", symbolSize=6,
-                name=label_prefix + " · Pср")
-            self.plot.plot(x, [point["result"]["output_pep_w"] for point in points],
-                pen=pg.mkPen(color, width=1, style=QtCore.Qt.PenStyle.DashLine), symbol="t", symbolSize=6,
-                name=label_prefix + " · PEP")
-        self.axes("Pin одного тона с поправкой, dBm", "Мощность, Вт")
+        self.results.show_metric("power")
 
     def plot_distortion(self):
-        self.plot.clear()
-        if not self.points:
-            return
-        self._show_legend()
-        groups = {}
-        for point in self.points:
-            plan = point["plan"]
-            groups.setdefault((plan["f1_hz"], plan["lo_dbm"]), []).append(point)
-        for index, ((frequency, lo_dbm), points) in enumerate(sorted(groups.items())):
-            points.sort(key=lambda point: point["plan"]["level1_dbm"])
-            x = [point["result"]["output_average_w"] for point in points]
-            color = pg.intColor(index, hues=max(1, len(groups)))
-            label_prefix = f"{frequency / 1e6:g} МГц · LO {lo_dbm:g} dBm"
-            for side, style in (("low", QtCore.Qt.PenStyle.SolidLine), ("high", QtCore.Qt.PenStyle.DashLine)):
-                y = [point["result"]["sides"][side]["im3_dbc"] for point in points]
-                self.plot.plot(x, [float("nan") if value is None else value for value in y], connect="finite",
-                    pen=pg.mkPen(color, width=2, style=style), symbol="o",
-                    name=label_prefix + f" · IM3 {side}")
-            for order in range(2, 8):
-                y = [next((band["dbc"] for band in point["harmonics"] if band["order"] == order), float("nan")) for point in points]
-                y = [float("nan") if value is None else value for value in y]
-                if any(math.isfinite(value) for value in y):
-                    self.plot.plot(x, y, connect="finite", pen=pg.mkPen(color, width=1,
-                        style=QtCore.Qt.PenStyle.DotLine), symbol="o", name=label_prefix + f" · H{order}")
-        self.axes("Средняя мощность двух основных тонов, Вт", "Уровень относительно одного тона, dBc")
-
-    def _show_legend(self):
-        legend = self.plot.plotItem.legend
-        if legend is None:
-            legend = self.plot.addLegend()
-        else:
-            legend.clear()
-            legend.show()
-
-    def axes(self, bottom, left):
-        for name, label in (("bottom", bottom), ("left", left)):
-            axis = self.plot.getAxis(name)
-            axis.setSIPrefixEnableRanges(())
-            axis.enableAutoSIPrefix(False)
-            axis.setLabel(label)
-        self.plot.enableAutoRange()
+        self.results.show_metric("distortion")
 
     def load_archive(self):
         if self.worker:
@@ -744,7 +806,7 @@ class TwoTonePanel(QtWidgets.QWidget):
             fixed = {key: value for key, value in plan.items()
                 if key not in ("level1_dbm", "level2_dbm", "f1_hz", "lo_hz", "lo_dbm")}
             fixed["level_difference"] = plan["level2_dbm"] - plan["level1_dbm"]
-            fixed["if_offset_hz"] = plan["lo_hz"] - plan["f1_hz"]
+            fixed["if_offset_hz"] = plan["lo_hz"] - plan["f1_hz"] if plan["mode"] == "mixer" else None
             fixed["demo"] = item["demo"]
             fixed["sample"] = item["context"].get("sample")
             fixed["series_id"] = item["context"].get("series_id")
@@ -754,8 +816,18 @@ class TwoTonePanel(QtWidgets.QWidget):
                          if row.get("context", {}).get("parent_spectrum_id") == item["id"]]
             points.append(dict(spectrum_id=item["id"], plan=plan, result=result, harmonics=harmonics, demo=item["demo"]))
         if len(signatures) > 1:
-            self.status.setText("Выберите одну серию архивным фильтром: частоты, тракты или серии различаются.")
-            return
+            series = {}
+            for point in points:
+                source = next(item for item in fundamentals if item["id"] == point["spectrum_id"])
+                context = source["context"]
+                key = context.get("series_id", source["id"])
+                label = f"{source['measured_at'][:19]} · {context.get('sample', '')} · {context.get('notes', '')[:100]} · {key}"
+                series.setdefault(key, dict(label=label, points=[]))["points"].append(point)
+            labels = [item["label"] for item in series.values()]
+            label, accepted = QtWidgets.QInputDialog.getItem(self, "Двухтоновая серия", "Выберите серию из отфильтрованного архива", labels, 0, False)
+            if not accepted:
+                return
+            points = next(item["points"] for item in series.values() if item["label"] == label)
         self.points = sorted(points, key=lambda point: (point["plan"]["f1_hz"], point["plan"]["lo_dbm"],
             point["plan"]["level1_dbm"]))
         self.plot_distortion()
@@ -785,15 +857,8 @@ class TwoTonePanel(QtWidgets.QWidget):
             try:
                 with open(path, "w", encoding="utf-8-sig", newline="") as stream:
                     writer = csv.writer(stream, delimiter=";")
-                    writer.writerow(["UUID", "RF1_Hz", "RF2_Hz", "LO_Hz", "LO_level_dBm", "Pin1_dBm", "Pavg_W", "PEP_W",
-                        "U_result_dB_k2", "IM3_low_dBc", "IM3_high_dBc", "Гармонические полосы JSON", "Поправки подтверждены"])
-                    for point in self.points:
-                        result, plan = point["result"], point["plan"]
-                        uncertainty = result.get("uncertainty", {})
-                        writer.writerow([point["spectrum_id"], plan["f1_hz"], plan["f1_hz"] + plan["spacing_hz"],
-                            plan["lo_hz"], plan["lo_dbm"], plan["level1_dbm"] - plan["loss1_db"], result["output_average_w"],
-                            result["output_pep_w"], uncertainty.get("expanded_uncertainty_k2_db"),
-                            result["sides"]["low"]["im3_dbc"], result["sides"]["high"]["im3_dbc"],
-                            json.dumps(point["harmonics"], ensure_ascii=False), result["calibrated"]])
+                    writer.writerow(columns())
+                    for point in self.results.rows:
+                        writer.writerow(row_values(point))
             except OSError as error:
                 self.status.setText("Ошибка CSV: " + str(error))

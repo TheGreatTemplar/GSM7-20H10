@@ -15,7 +15,7 @@ def parse_frequency_ranges(text, maximum_points=201):
     if not text.strip():
         return []
     frequencies = []
-    for entry in text.split(";"):
+    for entry in re.split(r"[;\r\n]+", text):
         entry = entry.strip().replace(",", ".")
         if not entry:
             continue
@@ -120,6 +120,8 @@ class TwoTonePlan:
     points: int = 3201
     harmonics: int = 5
     calibrated: bool = False
+    sweep_averages: int = 1
+    detector: str = "POS"
 
     @property
     def f2_hz(self):
@@ -148,6 +150,8 @@ class TwoTonePlan:
             raise FieldError("Для двухтонового IP3 выровняйте уровни на входе DUT до разности не более 0,5 дБ", "level1", "level2", "loss1", "loss2")
         if type(self.harmonics) is not int or not 1 <= self.harmonics <= 7:
             raise ValueError("Гармоники: 1 (без гармоник) … 7")
+        if type(self.sweep_averages) is not int or not 1 <= self.sweep_averages <= 50:
+            raise ValueError("Усреднение: 1…50 независимых развёрток на полосу")
         low, high = sorted(self.output_tones())
         if 2 * low - high <= 0:
             raise ValueError("Нижний IM3 должен иметь положительную частоту")
@@ -156,19 +160,26 @@ class TwoTonePlan:
                 raise ValueError("Для этого PA предел средней выходной мощности должен быть до 7 Вт")
             if self.pad_rating_w < self.max_output_w:
                 raise FieldError("Допустимая мощность первого аттенюатора меньше предела мощности PA", "pad_rating", "max_w")
-            predicted_pep_input = 10 * math.log10(self.max_output_w * 1000) + 3.0103 - self.output_loss_db
-            if self.output_loss_db < 20 or predicted_pep_input > self.reference_dbm - 3:
-                raise FieldError("Недостаточно ослабления для заданной мощности PA и запаса RSA; используйте 20 дБ / 10 Вт + дополнительный аттенюатор", "output_loss", "max_w", "reference_dbm")
+            # Ref Level is a spectral level, not the time-domain two-tone PEP.
+            # Use total average power as a conservative bound for either tone.
+            predicted_tone_input = 10 * math.log10(self.max_output_w * 1000) - self.output_loss_db
+            if self.output_loss_db < 20 or predicted_tone_input > self.reference_dbm - 3 + 1e-9:
+                maximum = 10 ** ((self.reference_dbm - 3 + self.output_loss_db - 30) / 10)
+                raise FieldError(f"Для этого ослабления и Ref Level задайте предел средней мощности не выше {maximum:.4g} Вт "
+                    "либо увеличьте ослабление до RSA. Нужен запас 3 дБ до Ref Level.", "output_loss", "max_w", "reference_dbm")
         for order in range(1, (self.harmonics if self.mode == "pa" else 1) + 1):
-            self.analyzer_config(order).validate()
-            if self.analyzer_config(order).span_hz / (self.points - 1) > self.rbw_hz / 2:
+            config = self.analyzer_config(order)
+            config.validate()
+            if config.span_hz / (config.points - 1) > self.rbw_hz / 2:
                 raise FieldError("Для выбранного интервала/гармоник увеличьте RBW или уменьшите интервал тонов", "spacing_hz", "rbw_hz", "points")
 
     def analyzer_config(self, order=1):
         low, high = sorted(self.output_tones())
-        return AnalyzerConfig(center_hz=(low + high) / 2 * order, span_hz=max(2000, 12 * self.spacing_hz * order),
+        span = max(2000, 12 * self.spacing_hz * order)
+        points = max(self.points, math.ceil(2 * span / self.rbw_hz) + 1) if order > 1 else self.points
+        return AnalyzerConfig(center_hz=(low + high) / 2 * order, span_hz=span,
             rbw_hz=self.rbw_hz, vbw_hz=self.rbw_hz, attenuation_db=self.attenuation_db,
-            reference_dbm=self.reference_dbm, points=self.points)
+            reference_dbm=self.reference_dbm, points=points, detector=self.detector)
 
 
 def watts(dbm):
@@ -214,6 +225,8 @@ def analyze_two_tone(spectrum):
             resolved = markers["im3_" + side]["power_dbm"] - noise >= 10
             sides[side] = dict(resolved=resolved, im3_dbc=product - fundamental if resolved else None,
                                noise_limit_dbc=noise + 10 + plan.output_loss_db - fundamental,
+                               fundamental_dbm=fundamental, product_dbm=product, pin_dbm=pin,
+                               ip3_estimate=ip3(pin, fundamental, product) if resolved else None,
                                ip3=ip3(pin, fundamental, product) if resolved and plan.calibrated else None)
         total = watts(p_low) + watts(p_high)
         pep = (math.sqrt(watts(p_low)) + math.sqrt(watts(p_high))) ** 2
@@ -222,6 +235,7 @@ def analyze_two_tone(spectrum):
             value_db=min(resolved_values) if resolved_values else None, marker=markers["fund_low"], markers=markers,
             sides=sides, noise_dbm=noise, output_average_w=total, output_pep_w=pep,
             fundamental_low_dbm=p_low, fundamental_high_dbm=p_high, calibrated=plan.calibrated,
+            ip3_basis="confirmed_paths" if plan.calibrated else "nominal_paths_estimate",
             verdict="not_requested", reason="Предварительно; PEP по двум основным тонам, гармонические полосы сохраняются отдельно")
     except (KeyError, TypeError, ValueError) as error:
         return dict(kind="two_tone", status="not_calculated", reason=str(error))

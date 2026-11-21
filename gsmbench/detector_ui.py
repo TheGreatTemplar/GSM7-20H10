@@ -23,6 +23,7 @@ from .validation import FieldError, FieldFeedback, StatusLabel
 from .rf_labels import SETTLING_TIME
 from .rsa import AcquisitionCancelled
 from .table_filters import FilterHeader, configure_table
+from .instrument_buttons import connection_test_button
 
 
 class DetectorWorker(QtCore.QThread):
@@ -78,7 +79,7 @@ class DetectorWorker(QtCore.QThread):
             run = dict(id=str(uuid.uuid4()), measured_at=datetime.now(timezone.utc).isoformat(), demo=settings["demo"],
                 sample=settings["sample"], notes=settings["notes"], source_kind=settings["source"],
                 meter_kind=settings.get("meter_kind", "hp34401a"),
-                source_endpoint={key: settings[key] for key in ("akip_host", "akip_port", "smu_host", "smu_port")},
+                source_endpoint={key: settings[key] for key in ("akip_host", "akip_port", "smu_host", "smu_port", "smr_port", "smr_baud") if key in settings},
                 meter=meter_settings, plan=asdict(plan), points=[], state="running",
                 calibration_basis="generator_readback_and_user_entered_attenuation", operation=self.operation)
             self.status.emit("Измерение фона при RF OFF")
@@ -311,7 +312,9 @@ class DetectorPanel(QtWidgets.QWidget):
         add("demo", "Режим", QtWidgets.QCheckBox("Демо без приборов")).setChecked(True)
         add("sample", "Детектор", QtWidgets.QLineEdit("LODET001"))
         add("notes", "Примечание", QtWidgets.QLineEdit())
-        add("source", "Источник", combo([("АКИП-3208", "akip"), ("SMU200A · A/1", "smu_a"), ("SMU200A · B/2", "smu_b")]))
+        add("source", "Источник", combo([("АКИП-3208", "akip"), ("SMU200A · A/1", "smu_a"), ("SMU200A · B/2", "smu_b"), ("R&S SMR20 · RS-232", "smr")]))
+        add("smr_port", "SMR20 · COM · 8N2 RTS/CTS", QtWidgets.QLineEdit("COM3"))
+        add("smr_baud", "SMR20 · скорость", combo([(str(value), value) for value in (9600, 19200, 38400)])).setCurrentIndex(1)
         add("akip_host", "IP АКИП", QtWidgets.QLineEdit("172.16.236.190"))
         add("akip_port", "TCP АКИП", number(5025, 1, 65535, 0))
         add("smu_host", "IP SMU", QtWidgets.QLineEdit("169.254.234.52"))
@@ -344,10 +347,18 @@ class DetectorPanel(QtWidgets.QWidget):
         form.addRow(connection)
         self.connection_buttons = []
         for title, operation in (("Источник", "source"), ("вольтметр", "meter")):
-            button = QtWidgets.QPushButton("Проверить " + title)
-            button.clicked.connect(lambda checked=False, operation=operation: self.launch(operation))
+            button = connection_test_button('Проверить ' + title,
+                lambda checked=False, operation=operation: self.launch(operation),
+                'Проверяет выбранный источник; RF не включается.' if operation == 'source' else
+                'Проверяет выбранный вольтметр и применяет настройки измерения DC.')
             self.connection_buttons.append(button)
+            connection.addWidget(QtWidgets.QLabel(title.capitalize()))
             connection.addWidget(button)
+        connection.addStretch()
+        self.connection_buttons[0].bind_endpoint(*(self.fields[key] for key in
+            ('source', 'smr_port', 'smr_baud', 'akip_host', 'akip_port', 'smu_host', 'smu_port', 'demo')))
+        self.connection_buttons[1].bind_endpoint(*(self.fields[key] for key in
+            ('meter_kind', 'dmm_host', 'dmm_port', 'com_port', 'baud', 'demo')))
         self.wiring_box = QtWidgets.QFrame()
         self.wiring_box.setObjectName("detectorWiring")
         wiring_layout = QtWidgets.QVBoxLayout(self.wiring_box)
@@ -474,7 +485,9 @@ class DetectorPanel(QtWidgets.QWidget):
         for key in ("akip_host", "akip_port"):
             self.form.setRowVisible(self.fields[key], akip)
         for key in ("smu_host", "smu_port"):
-            self.form.setRowVisible(self.fields[key], not akip)
+            self.form.setRowVisible(self.fields[key], self.fields["source"].currentData() in ("smu_a", "smu_b"))
+        for key in ("smr_port", "smr_baud"):
+            self.form.setRowVisible(self.fields[key], self.fields["source"].currentData() == "smr")
 
     def set_value(self, widget, value):
         if isinstance(widget, QtWidgets.QCheckBox):
@@ -503,8 +516,8 @@ class DetectorPanel(QtWidgets.QWidget):
         connection_keys = {"demo", "source", "meter_kind", "attenuation_db"}
         connection_keys.update(("dmm_host", "dmm_port") if self.fields["meter_kind"].currentData() == "dmm6500"
             else ("com_port", "baud"))
-        connection_keys.update(("akip_host", "akip_port") if self.fields["source"].currentData() == "akip"
-            else ("smu_host", "smu_port"))
+        connection_keys.update({"akip": ("akip_host", "akip_port"), "smr": ("smr_port", "smr_baud")}.get(
+            self.fields["source"].currentData(), ("smu_host", "smu_port")))
         if any(self.sender() is self.fields[key] for key in connection_keys):
             self.wiring.setChecked(False)
         if self.sender() is self.fields["demo"]:
@@ -528,6 +541,10 @@ class DetectorPanel(QtWidgets.QWidget):
             if self.owner.rf_workspace_busy():
                 raise ValueError("Сначала завершите измерения смесителя и отключите его RF-выходы")
             settings = self.settings()
+            if (operation in ("point", "series") and settings["source"] == "smr"
+                    and settings["meter_kind"] == "hp34401a"
+                    and settings["smr_port"].strip().upper() == settings["com_port"].strip().upper()):
+                raise FieldError("SMR20 и 34401A должны использовать разные COM-порты", "smr_port", "com_port")
             settings.update(root=str(self.root), database=str(self.store().path))
             for key in ("akip_port", "smu_port", "dmm_port", "samples"):
                 settings[key] = int(settings[key])
@@ -554,6 +571,8 @@ class DetectorPanel(QtWidgets.QWidget):
             self.worker.outputs.connect(self.outputs_changed)
             self.worker.updated.connect(self.show_run)
             self.worker.finished.connect(self.finished)
+            if operation in ('source', 'meter'):
+                self.connection_buttons[0 if operation == 'source' else 1].watch(self.worker, settings['demo'])
             self.set_busy(True)
             self.worker.start()
         except Exception as error:

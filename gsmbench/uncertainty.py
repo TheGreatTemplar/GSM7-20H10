@@ -89,12 +89,24 @@ def result_uncertainty(spectrum, result):
                 marker = markers.get(name)
                 if marker:
                     type_b_parts.append(rsa_level_standard_uncertainty(marker["frequency_hz"]))
+            raw = spectrum.get("averaging", {}).get("raw_sweeps", [])
+            if len(raw) > 1:
+                from .rsa import peak_near
+                window = min(spectrum.get("context", {}).get("two_tone_plan", {}).get("spacing_hz", 2000) * 0.2,
+                    spectrum["settings"]["rbw_hz"] * 3)
+                differences = [peak_near(item, markers[product]["frequency_hz"], window)["power_dbm"]
+                    - peak_near(item, markers[fundamental]["frequency_hz"], window)["power_dbm"] for item in raw]
+                type_a = statistics.stdev(differences) / math.sqrt(len(differences))
         type_b = math.sqrt(sum(value ** 2 for value in type_b_parts)) if len(type_b_parts) == 2 else None
         source_u = _calibrated_source_standard_uncertainty(spectrum)
         missing = []
         if type_b is None:
             missing.append("IM3 ниже порога; неопределённость этого результата не рассчитана")
-        missing.append("Повторяемость двухтоновой точки: снята одна развёртка")
+        if selected_side is None:
+            type_a = None
+        if len(spectrum.get("averaging", {}).get("raw_sweeps", [])) < 2:
+            type_a = None
+            missing.append("Повторяемость IM3: снята одна развёртка")
         if result.get("calibrated") and source_u is None:
             missing.append("Неопределённость уровня на входе DUT не найдена для оценки IIP3")
         scope = "Неопределённость IM3 относительно уровня основного тона; погрешности близких RSA-маркеров объединены без предположения об их корреляции."

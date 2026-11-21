@@ -18,6 +18,7 @@ BUTTON_HELP = {
     "Считать трассу": "Считывает уже имеющийся спектр RSA, не меняя настройки и состояния генераторов.",
     "Связь / состояние SMU": "Подключается к SMU200A и считывает паспорт и состояние каналов без включения RF.",
     "Связь / состояние АКИП": "Подключается к АКИП-3208 и считывает его паспорт и текущее состояние.",
+    "Связь / состояние источника LO": "Считывает паспорт и состояние выбранного источника LO: АКИП по Ethernet или SMR20 по RS-232. RF не включается.",
     "Применить CW · выходы OFF": "Настраивает частоты и уровни SMU в режиме CW. Оба выхода остаются выключенными.",
     "Включить по схеме измерения": "Включает RF-выходы, необходимые для выбранной схемы измерения.",
     "Отключить оба выхода SMU": "Отправляет RF OFF обоим каналам SMU и проверяет, что они отключены.",
@@ -99,7 +100,8 @@ class ButtonHints(QtCore.QObject):
         self.label.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.label.setWordWrap(True)
-        self.label.setMaximumWidth(360)
+        self.label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.label.setMaximumWidth(420)
         self.label.setStyleSheet("""
             QLabel
             {
@@ -122,9 +124,10 @@ class ButtonHints(QtCore.QObject):
 
     def show_hint(self):
         button = self.hovered() if self.hovered else None
-        if button is None or not isValid(button) or not isValid(self.label) or not button.isVisible() or not button.underMouse():
+        if (button is None or not isValid(button) or not isValid(self.label) or not button.isVisible()
+                or not button.rect().contains(button.mapFromGlobal(QtGui.QCursor.pos()))):
             return
-        text = hint_text(button)
+        text = hint_text(button) if isinstance(button, QtWidgets.QAbstractButton) else button.toolTip()
         if not text:
             return
         self.label.setText(text)
@@ -154,6 +157,26 @@ class ButtonHints(QtCore.QObject):
                 self.timer.start()
             elif kind == QtCore.QEvent.Type.ToolTip:
                 return True
+        elif isinstance(watched, QtWidgets.QWidget) and event.type() in (
+                QtCore.QEvent.Type.Enter, QtCore.QEvent.Type.Leave, QtCore.QEvent.Type.ToolTip, QtCore.QEvent.Type.Hide):
+            target = watched
+            while target is not None and not target.toolTip():
+                if target.isWindow():
+                    target = None
+                    break
+                target = target.parentWidget()
+            if target is not None and not isinstance(target, QtWidgets.QLabel):
+                current = self.hovered() if self.hovered else None
+                if event.type() in (QtCore.QEvent.Type.Enter, QtCore.QEvent.Type.ToolTip):
+                    if current is not target:
+                        self.hide_hint()
+                        self.hovered = weakref.ref(target)
+                        self.timer.start()
+                    if event.type() == QtCore.QEvent.Type.ToolTip:
+                        return True
+                elif current is target and (event.type() == QtCore.QEvent.Type.Hide or
+                        not target.rect().contains(target.mapFromGlobal(QtGui.QCursor.pos()))):
+                    self.hide_hint()
         elif event.type() == QtCore.QEvent.Type.WindowDeactivate and isinstance(watched, QtWidgets.QWidget):
             button = self.hovered() if self.hovered else None
             if button is not None and isValid(button) and isValid(watched) and watched is button.window():

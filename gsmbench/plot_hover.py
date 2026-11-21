@@ -104,6 +104,10 @@ class PointHover(QtCore.QObject):
         for line in self.lines:
             self.plot.addItem(line, ignoreBounds=True)
 
+    def clear(self):
+        self.hide()
+        self.scatters.clear()
+
     def eventFilter(self, watched, event):
         if not isValid(self.plot):
             return False

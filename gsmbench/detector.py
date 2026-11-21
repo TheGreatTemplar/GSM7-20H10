@@ -12,6 +12,7 @@ import uuid
 
 from .smu import Smu200a, SourcePlan, verified_off
 from .ssg import Ssg3000x, verified_ssg_off
+from .smr import Smr20, verified_smr_off
 from .validation import FieldError
 
 
@@ -129,8 +130,16 @@ class SmuDetectorSource:
         self.driver.close()
 
 
-# New generators (e.g. a serial SMR20) implement this same adapter interface.
-SOURCE_FACTORIES = {"akip": AkipDetectorSource, "smu_a": SmuDetectorSource, "smu_b": SmuDetectorSource}
+class SmrDetectorSource(AkipDetectorSource):
+    def __init__(self, settings, log):
+        self.driver = Smr20(settings.get('smr_port', 'COM3'), settings.get('smr_baud', 19200), log)
+
+    def off(self):
+        return verified_smr_off(self.driver)
+
+
+SOURCE_FACTORIES = {"akip": AkipDetectorSource, "smu_a": SmuDetectorSource,
+    "smu_b": SmuDetectorSource, "smr": SmrDetectorSource}
 
 
 class DetectorStore:

@@ -23,6 +23,7 @@ from .rsa import AcquisitionCancelled, AnalyzerConfig, Rsa6265, average_spectra,
 from .smu import Smu200a, SourcePlan, verified_off
 from .table_filters import FilterHeader, configure_table
 from .rf_archive import ArchiveLoader, archive_rows
+from .instrument_buttons import connection_test_button
 
 
 class RsaWorker(QtCore.QThread):
@@ -281,6 +282,8 @@ class RsaWindow(QtWidgets.QWidget):
         self.sweep_kind.currentIndexChanged.connect(self.sweep_defaults)
         self.update_lo()
         self.update_source_controls()
+        self.lo_source.currentIndexChanged.connect(self.update_lo_source_fields)
+        self.update_lo_source_fields()
         tab_index = settings.get("setup_tab", 0)
         if type(tab_index) is int and 0 <= tab_index < self.setup_tabs.count():
             self.setup_tabs.setCurrentIndex(tab_index)
@@ -441,26 +444,41 @@ class RsaWindow(QtWidgets.QWidget):
         self.field("if_loss_db", "Ослабление ввода IF, дБ", self.spin(0, 0, 100), form)
         self.field("source_path_known", "Поправки входов", QtWidgets.QCheckBox("Ослабления RF/LO проверены"), form)
         self.field("settling_s", SETTLING_TIME, self.spin(0.2, 0, 10), form)
-        self.button("Связь / состояние SMU", lambda: self.launch("smu_identify"), form)
+        self.smu_connection_button = connection_test_button('Связь / состояние SMU',
+            lambda: self.launch('smu_identify'), 'Читает паспорт и состояние выходов SMU200A. RF не включается.')
+        self.smu_connection_button.bind_endpoint(self.smu_host, self.smu_port, self.demo)
+        form.addRow('Проверка SMU', self.smu_connection_button)
         self.button("Применить CW · выходы OFF", lambda: self.launch("smu_apply"), form)
         self.button("Включить по схеме измерения", lambda: self.launch("smu_on"), form)
         self.button("Отключить оба выхода SMU", lambda: self.launch("smu_off"), form)
         generator_layout.addWidget(generator)
-        second_generator = QtWidgets.QGroupBox("АКИП-3208 / SSG3000X · LO")
+        second_generator = QtWidgets.QGroupBox("Отдельный генератор · LO")
         second_generator.setToolTip("Источник LO для двухтонового измерения смесителя")
         form = QtWidgets.QFormLayout(second_generator)
+        self.field("lo_source", "Источник LO", self.combo([("АКИП-3208 · Ethernet", "akip"),
+            ("R&S SMR20 · RS-232", "smr")]), form)
+        self.field("smr_port", "SMR20 · COM", QtWidgets.QLineEdit("COM3"), form)
+        self.field("smr_baud", "SMR20 · 8N2 · RTS/CTS", self.combo([(str(value), value)
+            for value in (19200, 9600, 38400)]), form)
         self.field("akip_host", "IP АКИП", QtWidgets.QLineEdit("172.16.236.190"), form)
         akip_port = QtWidgets.QSpinBox()
         akip_port.setRange(1, 65535)
         akip_port.setValue(5025)
         self.field("akip_port", "TCP-порт", akip_port, form)
-        self.button("Связь / состояние АКИП", self.identify_akip, form)
+        self.lo_connection_button = connection_test_button('Связь / состояние источника LO',
+            self.identify_akip, 'Проверяет выбранный источник LO: АКИП-3208 или SMR20. RF не включается.')
+        self.lo_connection_button.bind_endpoint(self.lo_source, self.smr_port, self.smr_baud,
+            self.akip_host, self.akip_port, self.demo)
+        form.addRow('Проверка источника LO', self.lo_connection_button)
         generator_layout.addWidget(second_generator)
         generator_layout.addStretch()
         analyzer = QtWidgets.QGroupBox("RSA · развёртка SA / dBm")
         form = QtWidgets.QFormLayout(analyzer)
         self.field("host", "IP RSA", QtWidgets.QLineEdit("172.16.236.90"), form)
-        self.button("Проверить связь RSA", lambda: self.launch("identify"), form)
+        self.rsa_connection_button = connection_test_button('Проверить связь RSA6265',
+            lambda: self.launch('identify'), 'Читает паспорт анализатора спектра.')
+        self.rsa_connection_button.bind_endpoint(self.host, self.demo)
+        form.addRow('Проверка RSA', self.rsa_connection_button)
         self.field("center_mhz", "Центр, МГц", self.spin(11.0592, 0.000001, 26500, 6), form)
         self.field("span_khz", "Обзор, кГц", self.spin(200, 0.001, 26500000), form)
         bandwidths = [(f"{value:g} Гц", value) for value in
@@ -854,6 +872,9 @@ class RsaWindow(QtWidgets.QWidget):
             self.worker.generator_state.connect(self.generator_updated)
             self.worker.spectrum.connect(self.received)
             self.worker.finished.connect(self.worker_finished)
+            if operation in ('identify', 'smu_identify'):
+                button = self.rsa_connection_button if operation == 'identify' else self.smu_connection_button
+                button.watch(self.worker, job_demo)
             self.worker.start()
         except Exception as error:
             if self.worker is None:
@@ -1231,6 +1252,15 @@ class RsaWindow(QtWidgets.QWidget):
     def identify_akip(self):
         self.views.setCurrentWidget(self.two_tone)
         self.two_tone.launch("identify")
+
+    def update_lo_source_fields(self, *args):
+        smr = self.lo_source.currentData() == "smr"
+        for key in ("smr_port", "smr_baud"):
+            widget = self.fields[key]
+            widget.parentWidget().layout().setRowVisible(widget, smr)
+        for key in ("akip_host", "akip_port"):
+            widget = self.fields[key]
+            widget.parentWidget().layout().setRowVisible(widget, not smr)
 
     def two_tone_busy(self, busy):
         self.form_panel.setEnabled(not busy)

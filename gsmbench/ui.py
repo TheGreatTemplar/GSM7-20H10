@@ -19,7 +19,9 @@ from .help_ui import AboutDialog, HelpDialog
 from .rsa_ui import RsaWindow
 from .table_filters import FilterHeader, configure_table
 from .detector_ui import DetectorPanel
-from .window_chrome import install_window_chrome
+from .rlc_ui import RlcPanel
+from .instrument_buttons import connection_test_button
+from .window_chrome import install_window_chrome, install_colored_caption, caption_native_event
 from .button_hints import install_button_hints
 
 
@@ -327,12 +329,15 @@ class Window(QtWidgets.QMainWindow):
         self.rsa_settings = {}
         self.detector_window = None
         self.detector_settings = {}
+        self.rlc_window = None
+        self.rlc_settings = {}
         self.setWindowIcon(QtGui.QIcon(str(ICON_PATH)))
         self.setWindowTitle(f"GSM7-20H10 · Компоненты и смесители · v{__version__}")
         self.resize(1320, 840)
         self.setMinimumSize(1000, 650)
         self.setStyleSheet(STYLE)
         self.build_menu()
+        install_colored_caption(self)
         self.build()
         self.load_settings()
         self.connect_autosave()
@@ -345,10 +350,15 @@ class Window(QtWidgets.QMainWindow):
         self.rsa_action = instruments_menu.addAction("Смесители · RSA6265 + SMU200A", self.show_rsa)
         instruments_menu.addAction("R&S SMU200A · Состояние выходов…", self.show_smu)
         instruments_menu.addAction("Детектор мощности LO · калибровка", self.show_detector)
+        instruments_menu.addAction("LCR · Е7-29", self.show_rlc)
         help_menu = self.menuBar().addMenu("Справка")
         self.help_action = help_menu.addAction("Помощь по программе…", self.show_help, "F1")
         help_menu.addSeparator()
         self.about_action = help_menu.addAction("О программе…", self.show_about)
+
+    def nativeEvent(self, event_type, message):
+        result = caption_native_event(self, message)
+        return result if result is not None else super().nativeEvent(event_type, message)
 
     def show_help(self):
         if self.help_dialog is None:
@@ -376,6 +386,19 @@ class Window(QtWidgets.QMainWindow):
             self.show_rsa()
         elif index == 2:
             self.show_detector()
+        elif index == 3:
+            self.show_rlc()
+
+    def show_rlc(self):
+        if self.rlc_window is None:
+            self.rlc_window = RlcPanel(self, ROOT, self.rlc_settings)
+            self.rlc_window.settings_changed.connect(self.save_rlc_settings)
+            self.rlc_layout.addWidget(self.rlc_window)
+        self.workspaces.setCurrentWidget(self.rlc_page)
+
+    def save_rlc_settings(self, settings):
+        self.rlc_settings = settings
+        self.settings_timer.start()
 
     def show_detector(self):
         if self.detector_window is None:
@@ -441,6 +464,9 @@ class Window(QtWidgets.QMainWindow):
         self.detector_page = QtWidgets.QWidget()
         self.detector_layout = QtWidgets.QVBoxLayout(self.detector_page)
         self.workspaces.addTab(self.detector_page, "Детектор мощности LO")
+        self.rlc_page = QtWidgets.QWidget()
+        self.rlc_layout = QtWidgets.QVBoxLayout(self.rlc_page)
+        self.workspaces.addTab(self.rlc_page, "LCR · Е7-29")
         self.workspaces.currentChanged.connect(self.workspace_changed)
         layout = QtWidgets.QVBoxLayout(root)
         layout.setContentsMargins(22, 18, 22, 12)
@@ -497,7 +523,10 @@ class Window(QtWidgets.QMainWindow):
         form.addRow("NPLC", self.nplc)
         form.addRow("Разрядность", self.digits)
         settings_layout.addWidget(connection)
-        self.button("Проверить связь · *IDN?", self.identify, settings_layout)
+        self.connection_button = connection_test_button('Проверить связь GSM7-20H10 · *IDN?', self.identify,
+            'Читает паспорт прибора. Выход источника не включается.')
+        self.connection_button.bind_endpoint(self.mode, self.host, self.port, self.resource)
+        form.addRow('Проверка связи', self.connection_button)
         note = QtWidgets.QLabel("TCP-порт или VISA-ресурс нужно сверить с прибором. Проверка связи не включает выход.")
         note.setWordWrap(True)
         settings_layout.addWidget(note)
@@ -775,7 +804,8 @@ class Window(QtWidgets.QMainWindow):
                     table_search=self.table_search.text(),
                     column_filters={str(column): sorted(values) for column, values in self.column_filters.items()},
                     rsa=self.rsa_window.settings() if self.rsa_window is not None else self.rsa_settings,
-                    detector=self.detector_window.settings() if self.detector_window is not None else self.detector_settings)
+                    detector=self.detector_window.settings() if self.detector_window is not None else self.detector_settings,
+                    rlc=self.rlc_window.settings() if self.rlc_window is not None else self.rlc_settings)
 
     def setting_widgets(self):
         return dict(kind=self.kind, sample=self.sample, model=self.model, batch=self.batch,
@@ -793,6 +823,8 @@ class Window(QtWidgets.QMainWindow):
                     self.rsa_settings = data["rsa"]
                 if isinstance(data.get("detector"), dict):
                     self.detector_settings = data["detector"]
+                if isinstance(data.get("rlc"), dict):
+                    self.rlc_settings = data["rlc"]
                 self.column_filters = {int(column): set(values)
                                        for column, values in data.get("column_filters", {}).items()
                                        if column.isdigit() and 0 <= int(column) < self.table.columnCount()
@@ -834,6 +866,8 @@ class Window(QtWidgets.QMainWindow):
                     self.workspaces.setCurrentIndex(1)
                 elif data.get("workspace_tab") == 2:
                     self.workspaces.setCurrentIndex(2)
+                elif data.get("workspace_tab") == 3:
+                    self.workspaces.setCurrentIndex(3)
             except Exception as error:
                 self.error(str(error))
 
@@ -906,6 +940,8 @@ class Window(QtWidgets.QMainWindow):
         self.controls.setEnabled(False)
         self.stop_button.setEnabled(recipe is not None)
         self.worker = Worker(self.settings(), recipe, metadata)
+        if recipe is None:
+            self.connection_button.watch(self.worker, self.mode.currentIndex() == 0)
         self.worker.log.connect(self.log.appendPlainText)
         self.worker.point.connect(self.add_point)
         self.worker.result.connect(self.save_result)
@@ -1259,6 +1295,11 @@ class Window(QtWidgets.QMainWindow):
             self.error(str(error))
 
     def closeEvent(self, event):
+        if self.rlc_window is not None and self.rlc_window.worker is not None:
+            self.rlc_window.stop()
+            event.ignore()
+            QtCore.QTimer.singleShot(100, self.close)
+            return
         if self.detector_busy():
             self.detector_window.stop()
             event.ignore()
